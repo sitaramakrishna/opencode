@@ -47,6 +47,10 @@ export type Toggles = {
   hang: boolean
   tokenize: boolean
   chunk_delay_ms: number
+  /** Sleep before the response headers, on top of the simulated prefill. */
+  header_delay_ms: number
+  /** GET /api/config (opencode's remote provider config) answers this; absent = 404. */
+  api_config?: { status: number; body?: unknown }
   /** Max characters per streamed delta; small values split words and `<think>` tags across deltas. */
   delta_chars: number
 }
@@ -130,6 +134,7 @@ const defaults: Toggles = {
   hang: false,
   tokenize: false,
   chunk_delay_ms: 0,
+  header_delay_ms: 0,
   delta_chars: 4,
 }
 
@@ -165,6 +170,7 @@ export async function startLocalServer(options: Partial<Toggles> = {}) {
   })
 
   async function route(req: Request, log: LoggedRequest) {
+    if (req.method === "GET" && log.path === "/api/config" && toggles.api_config) return Response.json(toggles.api_config.body ?? {}, { status: toggles.api_config.status })
     if (req.method === "GET" && log.path === "/v1/models") return models(toggles)
     if (req.method === "POST" && log.path === "/tokenize" && toggles.tokenize)
       return Response.json({ tokens: Array.from({ length: estimate(String(log.body?.content ?? "")) }, (_, i) => i) })
@@ -199,6 +205,7 @@ export async function startLocalServer(options: Partial<Toggles> = {}) {
     log.prefillMs = prefill(prompt, prompts, toggles)
     prompts.push(prompt)
     if (log.prefillMs > 0) await Bun.sleep(log.prefillMs)
+    if (toggles.header_delay_ms > 0) await Bun.sleep(toggles.header_delay_ms)
 
     const parts = pending.shift() ?? [reply.text("ok")]
     const error = parts.find((part) => part.type === "error")

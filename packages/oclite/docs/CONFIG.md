@@ -84,8 +84,37 @@ User-level config (`~/.config/oclite/…`) and `--mcp-config` are always trusted
 | `permission_timeout_ms` | integer | `300000` | How long an ask waits (REPL, MCP elicitation or `agent_permission_reply`) before it's denied |
 | `subagent.max_depth` | integer | `2` | Nesting limit for sub-agents (the parent agent's `max_depth` can lower it) |
 | `subagent.max_concurrent` | integer | `4` | Running sub-agents per parent; extras wait as `pending` |
+| `rtk` | `"auto"` \| `true` \| `false` | `"auto"` | Rewrite `bash` commands through `rtk rewrite` ([below](#rtk-and-style)) |
+| `style.caveman` | `off` \| `lite` \| `full` \| `ultra` | `off` | Terse-prose rule block in the system prompt ([below](#rtk-and-style)) |
+| `style.scope` | `subagents` \| `all` | `subagents` | Which sessions get the caveman block |
 
 Unknown keys are ignored.
+
+## `rtk` and `style`
+
+**`rtk`.** `rtk` is a CLI proxy that compresses command output for LLMs.
+`"auto"` turns the rewrite on when `rtk` resolves on PATH (looked up once per run, so every sub-agent run checks
+too); `true` does the same but prints one notice if rtk is missing (commands then run unchanged); `false` turns it
+off. Before spawning, the `bash` tool runs `rtk rewrite <command>` (2 s timeout). Exit 0 with non-empty output that
+differs → the rewritten command runs, with the resolved rtk's directory first on that spawn's PATH so it calls the
+same binary, and a `rtk: <original> → <rewritten>` notice is shown. Anything else (exit 1, timeout, empty
+output, spawn error) → the original runs. The tool result is the command's output; the session's `tool_call`
+record keeps the original command.
+
+*Security invariant:* the permission check and PreToolUse hooks see the model's **original** command, exactly as
+without rtk. The rewrite happens after approval and never widens what's allowed: a rule `bash: {"ls *": "allow"}`
+still allows `ls -la` even though `rtk ls -la` wouldn't match it, a denied original stays denied, and a rule that
+would allow only the rewritten form grants nothing. Unlike Claude Code's rtk hook, a rewrite is never
+auto-approved. The rewrite is rtk's own mapping, so trusting rtk on PATH is part of enabling it.
+
+**`style`.** `caveman` appends a short "Response style" block (about 360–420 chars) at the very end of the system
+prompt, after the env block, so the cached prefix ahead of it is unchanged. `lite` drops filler and hedging but
+keeps grammar; `full` allows fragments and short words in a `[thing] [action] [reason]. [next step].` pattern;
+`ultra` adds abbreviations and arrows. All levels keep code, commands, paths, identifiers, errors and numbers exact,
+use normal prose for security warnings, destructive or irreversible actions and ordered steps, and leave code,
+commits and file contents alone. With `scope: "subagents"` only runs at depth > 0 get it (`task` children at any
+depth, and `transport: mcp` children, which start at `OCLITE_DEPTH`); `"all"` adds it to the main agent too, and
+`oclite debug prompt` then shows it.
 
 ## `provider`
 
@@ -96,7 +125,9 @@ Unknown keys are ignored.
     "options": {
       "baseURL": "http://127.0.0.1:8000/v1",
       "apiKey": "{env:LOCAL_KEY}",          // optional for local servers (no Authorization header without it)
-      "headers": { "X-Team": "infra" }
+      "headers": { "X-Team": "infra" },
+      "headerTimeout": 1800000,             // ms to the first response byte; false = no limit
+      "chunkTimeout": 600000                // ms between streamed chunks; false = no limit
     },
     "models": {
       "<model id>": {
@@ -115,7 +146,7 @@ How a `provider/model` ref resolves:
 - `openai/…` without `options.baseURL` → OpenAI API. Key: `options.apiKey`, else `OPENAI_API_KEY`.
 - Anything else with `options.baseURL` (including `openai` with a baseURL) → openai-compatible chat completions.
   These servers are probed (README → What you'll see and why). A loopback base URL makes the automatic profile `local`.
-- Anything else without `options.baseURL` → config error (exit 2).
+- Anything else without `options.baseURL` → the cached opencode catalog decides (below); not in it → config error (exit 2).
 
 Hosted providers aren't probed. They get a static capability record (context 200,000 unless
 `models.<id>.limit.context` or a `servers` pin says otherwise).
@@ -124,6 +155,68 @@ Hosted providers aren't probed. They get a static capability record (context 200
 for reasoning models (`reasoning: true`, or a local server where the probe saw reasoning output).
 
 API keys, header values and credentials in `baseURL` are registered as secrets and redacted everywhere.
+
+### Hosted catalog providers and opencode credentials
+
+Any provider in opencode's **cached** models.dev catalog (OpenCode Zen as `opencode`, `google`, `amazon-bedrock`,
+`azure`, `openrouter`, `xai`, other openai-compatible ones) works without a `baseURL`.
+
+- **Catalog source**, read-only and never fetched: `$XDG_DATA_HOME/opencode/opencode.db` (`kv['models-dev:catalog']`),
+  else `models.json` (`$OPENCODE_MODELS_PATH`, default `$XDG_CACHE_HOME/opencode/models.json`). Run opencode once to
+  create or refresh it. It supplies `npm`, `api` (the base URL), `env`, `limit.context`, `limit.output` and `reasoning`.
+  `provider.<id>.models.<m>.limit`, `reasoning` and `servers` pins still win.
+- **npm**: `provider.<id>.npm`, else the catalog model's `provider.npm`, else the catalog provider's `npm`.
+  Supported: `@ai-sdk/openai`, `azure`, `anthropic`, `google`, `amazon-bedrock`, `openai-compatible`,
+  `@openrouter/ai-sdk-provider`. Anything else is a config error (exit 2).
+- **baseURL**: `options.baseURL`, else the catalog `api`. Catalog-known models are not probed, get the `default`
+  profile and a static capability record. `max_tokens` is the catalog output limit capped at 32,000 (as opencode does).
+- **Credential order**: `options.apiKey`; then the catalog's `env` variables (and `ANTHROPIC_API_KEY` /
+  `OPENAI_API_KEY` for those packages); then opencode's store: `opencode.db` table `credential` (newest row for the
+  provider id), `auth.json` (`type` `api`/`wellknown`/`oauth`), `OPENCODE_AUTH_CONTENT`. Zen with none of these sends
+  `"public"`, which works for free models only (a paid model is rejected by the server with an auth error).
+- **OAuth expiry**: the stored `access` token is used while it has more than a minute left. Otherwise oclite fails with
+  `opencode login for "<id>" expired — run opencode once to refresh it, then retry`. oclite never refreshes (opencode's
+  refresh tokens rotate) and never writes opencode's files.
+- **Security rule**: a looked-up credential (env or store) is attached only when the effective baseURL equals the
+  catalog's `api` for that provider, or comes from the **user** config layer. A project-config `baseURL` for such a
+  provider is an error (`not sending your … credential to …, a baseURL from project config`); set it in user config or
+  put `options.apiKey` next to it. A loopback `baseURL` that is not the catalog's `api` behaves as before (probed, only
+  `options.apiKey`). Looked-up values are registered as secrets: they never appear in `debug server`, `debug prompt`,
+  stream-json, errors or logs; `debug server` shows only a label (`opencode.db oauth`, `env NAME`, `config apiKey`, `public`).
+
+- **`/api/config` step** (provider `opencode` only). When the credential is the `opencode` integration login in
+  `opencode.db` (OAuth, or a service-account `key` row) and no `options.apiKey` or catalog env key (`OPENCODE_API_KEY`)
+  wins, oclite does what opencode does: `GET ${metadata.server}/api/config` (default server
+  `https://opencode.ai/console`, must be https or loopback) with `Authorization: Bearer <access or key>` and
+  `x-org-id: <metadata.orgID>` when present. The login is only read. The call runs once per process (10 s timeout) and the
+  result is kept in memory; there is no on-disk cache. Its `config.provider.<id>` then overrides the catalog for that
+  provider: `api` url, `npm`, `options.headers` (sent as request headers), other `options` (merged into the request body;
+  `apiKey` and `headers` are dropped, the login stays the credential) and per model `id`, `provider.npm/api` (the
+  provider's `api` when a model has none), `headers`, `options`, `limit`, `cost`. Your own `options.headers` win over
+  remote headers. The login goes only to the url `/api/config` (or the catalog) declares, or to a user-config baseURL;
+  a baseURL override ignores the remote headers and options. `debug server` shows `auth opencode.db oauth + api/config`
+  and the remote header **names** (never values). **Failures:** 404 continues with catalog defaults (as opencode);
+  401/403 stops with `opencode login rejected by …/api/config (HTTP n) — run opencode once to refresh the login`;
+  another status, a timeout or a network error continues with catalog defaults and says so in the auth label.
+- **Zen free tier**: not usable from oclite. Zen answers the `"public"` key (and free models without an app login)
+  with `403 FreeTierError: OpenCode's free tier can only be used from within OpenCode`. oclite adds no client-identity
+  headers of its own and does not try to get around that. Paid Zen models work through your login and `/api/config`.
+
+**Streaming timeouts.** `options.headerTimeout` and `options.chunkTimeout` use opencode's names and shape (ms,
+`false` = off), so the same block works in both tools. `headerTimeout` is the wait from sending the request to the
+first response byte. llama.cpp sends headers only once generation starts, so it covers prefill. `chunkTimeout` is the
+longest gap between streamed chunks; reasoning deltas count as chunks, so a thinking model keeps the stream alive.
+
+| Base URL | `headerTimeout` | `chunkTimeout` |
+|---|---|---|
+| hosted or remote (opencode's default) | 300000 (5 min) | 300000 (5 min) |
+| loopback (`localhost`, `127.*`, `::1`) | 1800000 (30 min) | 600000 (10 min) |
+
+The loopback defaults are long because a cold ~60k-token prompt on a slow local model can take about 6 minutes to
+prefill, and a thinking model can produce hundreds of reasoning tokens before any visible text. On timeout the turn
+fails with, for example, `no response from http://127.0.0.1:8080/v1 within 1800 s (prefill of a large prompt on a
+slow local model can take minutes; raise provider.local.options.headerTimeout)`. A timeout is retried once at most;
+re-sending the same large prompt mostly repeats the wait. These timers replace Bun's built-in 300 s fetch timeout.
 
 ## `mcp`
 
@@ -157,6 +250,12 @@ opencode's `ConfigMCPV1` shape, unchanged:
   `oclite mcp auth <name>`). OAuth tokens are stored in opencode's `~/.local/share/opencode/mcp-auth.json`.
 - `environment` values are redacted everywhere, whatever their key. `OCLITE_MCP_TOKEN` is never passed to stdio
   servers.
+- In the `local` and `local-min` profiles, MCP tool schemas are deferred behind `tool_search`. Its description lists
+  the deferred tool names per server (names only, no schemas), fixed for the run so the request prefix stays
+  byte-stable: `Find MCP tools by keyword; matches load next turn. Tools: context7: query-docs, resolve-library-id;
+  git: git_add, git_branch, …`. Over 400 chars it lists only server names and tool counts (`git (12 tools)`).
+  A prompt that names a server as MCP (`git mcp`, `mcp server git`, `mcp__git__…`) loads that server's tools from
+  the first request. The `default` profile sends every MCP schema and has no `tool_search`.
 - `--mcp-config` also accepts Claude Code's `{"mcpServers": {...}}`. Entries with a `url` (and `type` other than
   `stdio`) become `remote`; the rest become `local` with `command: [command, ...args]` and `environment: env`.
 
@@ -195,6 +294,14 @@ permission mode → parent session (for sub-agents) → `--allowed-tools` / `--d
 and `--allowed-tools` can't lift read_only. Note that `bypassPermissions` comes after config and agent rules, so it
 overrides their denies.
 
+**Repeated calls (`doom_loop`).** As in opencode, a call identical to the two before it (same tool, same input)
+checks the `doom_loop` permission first (pattern: the tool name; default `ask`, so `-p` rejects it and counts a
+denial). Set `"doom_loop": "allow"` to turn the check off. Separately, a call denied 3 times with identical input in
+one run isn't retried forever: a `-p` run ends at once with exit 3 and a message naming the call and how to allow it,
+e.g. `stopped: bash git log -1 --pretty=%B was denied 3 times with identical input. To allow it: --allowed-tools
+"bash(git log*)" or a permission rule`. In the REPL the model gets a `<system-reminder>` that the call is denied and
+must not be retried, and the run stops after 3 more identical denials.
+
 `--allowed-tools` / `--disallowed-tools` take comma- or space-separated rules: `read`, `bash(git *)`, Claude's
 `Bash(npm test:*)` (`:*` means prefix), `mcp__github__*`. Claude tool names (`Read`, `Edit`, `MultiEdit`, `Bash`,
 `Grep`, `Glob`, `LS`, `WebFetch`, `Task`, `TodoWrite`, `ToolSearch`) map to oclite's.
@@ -219,7 +326,7 @@ Frontmatter (opencode's `ConfigAgentV1`):
 |---|---|
 | `description` | Shown in agent lists and in the `task` tool |
 | `mode` | `primary`, `subagent` or `all` (default `all`). Only non-primary agents can be sub-agents; only non-subagent agents are MCP prompts |
-| `model` | `provider/model`; unset = inherit |
+| `model` | `provider/model`; unset = inherit. For a sub-agent: its own `model`, else the model given with the spawn (MCP `agent_spawn`/`spawn` `model`), else its **parent's resolved model**, else the global `model`. A local-only primary agent therefore keeps its sub-agents local; this also holds at depth 2 and for `transport: mcp` children (the parent's model travels as the child's spawn `model`) |
 | `temperature`, `top_p` | Sampling |
 | `steps` | Maximum model turns for this agent |
 | `permission` | Rules as in [`permission`](#permission) |
@@ -260,7 +367,10 @@ inherit, and a `tools:` list (string or array) **only restricts**: every built-i
 and listed tools keep their normal rules (they're not auto-allowed). Listing an MCP tool also enables `tool_search`.
 Files that don't parse are skipped instead of failing the CLI.
 
-Config overrides use the same fields: `{"agent": {"build": {"model": "local/qwen3-coder", "steps": 40}}}`.
+Config overrides use the same fields: `{"agent": {"build": {"model": "local/qwen3-coder", "steps": 40}}}`. That
+includes the `tools` list (`{"agent": {"build": {"tools": ["task", "todowrite"]}}}`, the same as
+`"options": {"tools": [...]}`). The `{tool: boolean}` record still works too, and untrusted project config keeps only
+its `false` entries, as for agent files.
 
 ## `instructions` and instruction files
 
@@ -321,7 +431,8 @@ Pinned fields are never probed. The probe result is cached for 7 days in
 
 | Variable | Meaning |
 |---|---|
-| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | Hosted provider keys when the config has no `apiKey`. Redacted in all output |
+| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and each catalog provider's `env` names (e.g. `OPENCODE_API_KEY`) | Hosted provider keys when the config has no `apiKey`. Redacted in all output |
+| `OPENCODE_AUTH_CONTENT`, `OPENCODE_MODELS_PATH` | opencode's auth JSON and catalog file, read-only fallbacks (see Hosted catalog providers) |
 | `OCLITE_MCP_TOKEN` | Bearer token required by `mcp serve --transport http`; also sent by `transport: mcp` agents to loopback `mcp.url`s. Not passed to bash, hooks, MCP stdio servers or children |
 | `OCLITE_MCP_MAX_SESSIONS` | HTTP MCP sessions at once (default 16) |
 | `OCLITE_MCP_MAX_RUNS` | Live runs per `mcp serve` process (default 8) |

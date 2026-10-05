@@ -152,6 +152,8 @@ export interface ResolvedConfig {
   subagent: { max_depth: number; max_concurrent: number }   // 2, 4
   thinking?: Thinking; showThinking: boolean     // --thinking; --no-thinking → showThinking=false
   appendSystemPrompt?: string; maxTurns?: number
+  rtk?: "auto" | boolean                         // bash rewrite via `rtk rewrite`; undefined = "auto"
+  style?: { caveman: "off" | "lite" | "full" | "ultra"; scope: "subagents" | "all" }   // "off", "subagents"
 }
 export class AppConfig extends Context.Service<AppConfig, ResolvedConfig>()("oclite/AppConfig") {}
 
@@ -173,6 +175,7 @@ export interface Profile {
   tools: readonly string[]; optionalTools: readonly string[]   // optional = enabled via AgentDef.tools
   descriptionMaxChars: number | undefined; mcp: "all" | "deferred"; instructionCapChars: number | undefined
   title: boolean; stubAfterTurns: number; compactAt: number; budgetTokens: number
+  toolOutputShare: number                        // one tool result ≤ share × context window (chars/4), ≤ 50 KB
 }
 
 // ---- render (render/) ----
@@ -407,7 +410,7 @@ run(input):
     compaction.maybe(history, handle, profile, agent)             // §6; may emit status compact
     thinking = agent.thinking=="auto" ? (lastUserIsFresh ? true : false) : agent.thinking=="on"
     events = gateway.stream(handle, {system, messages: toMessages(history, reminders), tools: tools.definitions, thinking, onQueued})
-             |> retry(2s,4s,8s ×3 on transport/5xx; status retry {attempt, wait_ms})
+             |> retry(2s,4s,8s ×3 on transport/5xx; a Timeout once at most; status retry {attempt, wait_ms})
     fold events:
       text-delta → sink text_delta          reasoning-delta → sink reasoning_delta
       tool-call  → sink tool_start; store tool_call; collect
@@ -422,7 +425,10 @@ run(input):
       outcome = hooks.run("Stop"); block → add reminder, continue ; else end("stop")
     dispatch: readOnly calls concurrently (Effect.all concurrency "unbounded"), others sequential in order,
               each via ToolRuntime.dispatch(tools.tools, call) (wrapper does permission/hooks/timeout/truncate)
+              a call identical to the previous two → Permission.check("doom_loop", [tool]) first (default ask)
               sink tool_end; store tool_result
+    same call denied 3× (identical input): headless → end("error", allow hint) → exit 3;
+              REPL → reminder "denied, must not be retried", end after 3 more
     turn++
 ```
 
@@ -540,7 +546,9 @@ drops `mcp` from layers 2–3.
              "PostToolUse": [], "Stop": [] },
   "servers": { "http://127.0.0.1:8000/v1": { "capabilities": { "tools_native": false }, "context_window": 32768, "max_tokens": 4096, "concurrency": 1 } },
   "permission_timeout_ms": 300000,
-  "subagent": { "max_depth": 2, "max_concurrent": 4 }
+  "subagent": { "max_depth": 2, "max_concurrent": 4 },
+  "rtk": "auto",                                   // "auto" | true | false: bash rewrite after approval (CONFIG.md)
+  "style": { "caveman": "off", "scope": "subagents" }   // terse-output block appended to the system prompt
 }
 ```
 
@@ -580,6 +588,11 @@ drops `mcp` from layers 2–3.
 | stubAfterTurns | 6 [R] | 6 [R] | 3 |
 | compactAt | 0.75 | 0.75 | 0.60 |
 | budgetTokens | 2500 **[LEAD]** see §15 | 1200 | 600 |
+| toolOutputShare | 0.25 | 0.15 | 0.15 |
+
+`toolOutputShare`: one tool result (or tool error) is cut to `share × context window × 4` chars, never above
+50 KB; the rest goes to the overflow file. The window is the one in `ToolSet.context`, lowered by a
+context-overflow 400.
 
 All profiles: `maxTokens = pin ?? model limit.output ?? 4096`, at least 8192 when `handle.reasoning` [R]. Tools
 are sorted by name. The env block is `cwd, platform, date (YYYY-MM-DD), git branch`, with no time.
@@ -649,6 +662,7 @@ Fallback ladder, mapped to code sites:
 | concurrency=1 | `llm/client.ts` semaphore; title off | status queued |
 | slow prefill | `runtime/loop.ts` thinking resolution → `chat_template_kwargs.enable_thinking` or `/no_think` (only if `no_think_suffix` pinned) | – |
 | 5xx / drop mid-stream | `runtime/loop.ts` retry 2/4/8 s ×3 | status retry |
+| stalled server / slow prefill | `llm/client.ts` fetch shim: `headerTimeout` (to first byte) and `chunkTimeout` (between body reads, reasoning included), opencode's provider options; loopback 30 min / 10 min, else 300 s; fired timer → `Transport` kind `Timeout`; `runtime/loop.ts` retries it once | status retry, then error |
 | tool hang | `tools/registry.ts` timeout + `tools/bash.ts` kill(-pgid) | tool_end timeout |
 | unreachable at start | `llm/probe.ts` R1 / first stream → ConfigError exit 2; REPL `/reconnect` → `gateway.resolve(ref,{reprobe:true})` | error |
 
@@ -699,10 +713,14 @@ up to 8 chars across deltas.
 - Description is `[<server>] <description>`. For local profiles it's truncated to `descriptionMaxChars`.
 - `readOnly = annotations.readOnlyHint === true`; `access = { permission: name, patterns: ["*"] }`.
 - `default` sends all schemas. `local` and `local-min` send only `tool_search`:
+  - description: one sentence plus the deferred-tool index (`Tools: git: git_log, …; context7: …`, names only,
+    sorted, fixed for the run; over 400 chars, `git (12 tools)` counts). The profile JSON has no tool_search entry;
   - input `{query: string, limit?: number(≤10, default 5)}`;
   - output: lines of `name — description`;
   - side effect `toolset.activate(names)`: matching schemas join from the next request, and the activation is
     persisted as `tools_activated`.
+- A prompt naming a server as MCP (`git mcp`, `mcp server git`, `mcp__git__…`) activates that server's tools at
+  run start (persisted like a tool_search activation), so they're in the first request.
 - Server `instructions` are appended once per server, only when its tools are in the request.
 - Prompts: REPL `/mcp__<server>__<prompt> k=v …` → `getPrompt` → the user message.
 - Resources: `@<server>:<uri>` → `readResource`. Text over 8 KB is written to a temp file and attached by path.

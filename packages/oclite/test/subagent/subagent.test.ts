@@ -6,6 +6,7 @@ import { Effect } from "effect"
 import type { SessionRecord } from "../../src/contract"
 import { ENVELOPE_CHARS } from "../../src/subagent/manager"
 import { reply } from "../lib/local-server"
+import { rtkPath } from "../tools/harness"
 import { setup, systemOf, taskIds, toolNames } from "./harness"
 
 const task = (args: Record<string, unknown>) =>
@@ -16,6 +17,26 @@ const subagentRows = (records: readonly SessionRecord[]) =>
   records.flatMap((record) => (record.type === "subagent" ? [record] : []))
 
 describe("sub-agents", () => {
+  test("a child gets the rtk rewrite and the caveman style; the parent (scope subagents) keeps its prompt", async () => {
+    await using _path = await rtkPath()
+    await using env = await setup({
+      config: { rtk: true, permission: { task: "allow", bash: "allow" }, style: { caveman: "full" } },
+    })
+    env.parent.queue(task({ subagent_type: "code", prompt: "list files" }))
+    env.parent.queue(reply.text("parent done"))
+    env.child.queue(reply.tool_call({ name: "bash", args: { command: "ls -la" } }))
+    env.child.queue(reply.text("files listed"))
+    const out = await env.run("go")
+    expect(out.result.state).toBe("completed")
+    const childId = taskIds(results(out.records)[0]!.output)[0]!
+    const childResults = results(await Effect.runPromise(out.store.read(childId)))
+    expect(childResults.map((record) => [record.name, record.status, record.output])).toEqual([["bash", "ok", "REWRITTEN"]])
+    expect(env.events.some((event) => event.type === "status" && event.agent_path[0] === "code"
+      && event.message === "rtk: ls -la → echo REWRITTEN")).toBe(true)
+    expect(systemOf(env.child.chats()[0]!.body)).toContain("# Response style\nRespond terse.")
+    expect(systemOf(env.parent.chats()[0]!.body)).not.toContain("# Response style")
+  })
+
   test("foreground: the envelope comes back and the child sees only the brief", async () => {
     await using env = await setup()
     env.parent.queue(task({ prompt: "BRIEF-XYZ: find the config loader" }))
@@ -204,5 +225,63 @@ describe("sub-agents", () => {
     ])
     expect(out.result.denied).toBe(1)
     expect(existsSync(path.join(env.project.path, "granted.txt"))).toBe(false)
+  })
+
+  describe("model inheritance", () => {
+    // Global default is the child server (kid/m); the parent is pinned to dad/m. A sub-agent with no model of its own must follow the parent.
+    const PINNED = "---\nmode: primary\nmodel: dad/m\ntools: [task]\n---\nYou are the pinned build agent."
+    const PLAIN = "---\nmode: subagent\ndescription: plain helper without a model\ntools: [task]\npermission:\n  task: allow\n---\nYou are the plain helper."
+    const options = { config: { model: "kid/m" }, build: PINNED, agents: { plain: PLAIN } }
+    const spawnTask = (agent: string) => task({ subagent_type: agent })
+
+    test("a sub-agent without a model follows its pinned parent, not the global default", async () => {
+      await using env = await setup(options)
+      env.parent.queue(spawnTask("plain"))
+      env.child.queue(reply.text("must not be used"))
+      env.parent.queue(reply.text("plain answered"))
+      env.parent.queue(reply.text("parent done"))
+      const out = await env.run("go")
+      expect(out.result).toMatchObject({ state: "completed", text: "parent done" })
+      expect(env.child.chats()).toHaveLength(0)
+      expect(env.parent.chats().map((chat) => systemOf(chat.body).includes("plain helper"))).toEqual([false, true, false])
+    })
+
+    test("a sub-agent with its own model keeps it", async () => {
+      await using env = await setup(options)
+      env.parent.queue(spawnTask("explore"))
+      env.parent.queue(reply.text("parent done"))
+      env.child.queue(reply.text("explore answered"))
+      const out = await env.run("go")
+      expect(out.result.state).toBe("completed")
+      expect(env.child.chats()).toHaveLength(1)
+      expect(env.parent.chats()).toHaveLength(2)
+    })
+
+    test("a model given with the task wins over the parent's", async () => {
+      await using env = await setup(options)
+      env.child.queue(reply.text("explicit model answered"))
+      await env.within((runtime) =>
+        Effect.gen(function* () {
+          const info = yield* runtime.subagents.spawn({ parent: { session_id: "ses_parent", depth: 0, ruleset: [], call_id: "call_x", cwd: env.project.path, model: "dad/m" },
+            agent: "plain", prompt: "BRIEF", description: "explicit", background: false, model: "kid/m", sink: env.sink })
+          yield* runtime.subagents.wait(info.id)
+        }),
+      )
+      expect(env.child.chats()).toHaveLength(1)
+      expect(env.parent.chats()).toHaveLength(0)
+    })
+
+    test("depth 2 inherits the parent's model through a model-less middle agent", async () => {
+      await using env = await setup(options)
+      env.parent.queue(spawnTask("plain"))
+      env.parent.queue(spawnTask("plain"))
+      env.parent.queue(reply.text("grandchild done"))
+      env.parent.queue(reply.text("child done"))
+      env.parent.queue(reply.text("parent done"))
+      const out = await env.run("go")
+      expect(out.result).toMatchObject({ state: "completed", text: "parent done" })
+      expect(env.child.chats()).toHaveLength(0)
+      expect(env.parent.chats()).toHaveLength(5)
+    })
   })
 })

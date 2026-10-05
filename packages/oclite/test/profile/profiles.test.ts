@@ -20,7 +20,8 @@ afterAll(async () => {
   await data[Symbol.asyncDispose]()
 })
 
-const TOOLS = ["bash", "edit", "glob", "grep", "question", "read", "skill", "task", "todowrite", "tool_search", "webfetch", "write"]
+// tool_search is left out: its own text carries the run's deferred-tool index (mcp/tools.ts searchTool).
+const TOOLS = ["bash", "edit", "glob", "grep", "question", "read", "skill", "task", "todowrite", "webfetch", "write"]
 const agent: AgentDef = {
   name: "build", mode: "primary", prompt: "You are the build agent.", permission: [], options: {}, source: "builtin",
   transport: "in-process", max_depth: 2, read_only: false, thinking: "auto", tools: ["todowrite", "not-a-tool"],
@@ -91,5 +92,12 @@ describe("byte-stable composition", () => {
     expect(env).not.toMatch(/\d{1,2}:\d{2}/)
     expect(a.system.indexOf("You are oclite")).toBe(0)
     expect(a.system.indexOf("You are the build agent.")).toBeLessThan(a.system.indexOf("<env>"))
+  })
+
+  test("debug prompt (main agent) shows the caveman block with scope all, not with scope subagents", async () => {
+    const { local, cfg } = await handles()
+    const at = (scope: "subagents" | "all") => ({ ...cfg, style: { caveman: "full" as const, scope } })
+    expect((await compose(at("subagents"), local, PROFILES.local, agent)).system).not.toContain("# Response style")
+    expect((await compose(at("all"), local, PROFILES.local, agent)).system).toEndWith("Style applies to prose only.")
   })
 })

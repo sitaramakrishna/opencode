@@ -82,6 +82,24 @@ describe("system prompt layering", () => {
     expect(full.text).toContain("a".repeat(5000))
   })
 
+  test("caveman style: sub-agents only by default, everyone with scope all, never when off; levels differ", async () => {
+    await using env = await setup({})
+    const prompt = async (caveman: "off" | "lite" | "full" | "ultra", scope: "subagents" | "all", depth: number) =>
+      (await system({ harness: "H", agent, cfg: { ...env.cfg, style: { caveman, scope } }, profile: PROFILES.local, home: env.home.path, depth })).text
+    const sub = await prompt("full", "subagents", 1)
+    expect(sub).toContain("# Response style\nRespond terse.")
+    expect(sub.indexOf("# Response style")).toBeGreaterThan(sub.indexOf("</env>"))
+    expect(await prompt("full", "subagents", 2)).toBe(sub)
+    expect(await prompt("full", "subagents", 0)).not.toContain("# Response style")
+    expect(await prompt("full", "all", 0)).toBe(sub)
+    expect(await prompt("off", "all", 1)).not.toContain("# Response style")
+    const levels = await Promise.all((["lite", "full", "ultra"] as const).map((level) => prompt(level, "all", 0)))
+    expect(new Set(levels).size).toBe(3)
+    const block = sub.slice(sub.indexOf("# Response style"))
+    expect(block.length).toBeLessThanOrEqual(600)
+    expect(block).toContain("Keep exact: code, commands, file paths")
+  })
+
   test("git branch from .git/HEAD: branch, detached sha, worktree pointer, none", async () => {
     await using dir = await tmpdir({ git: true })
     await dir.write(".git/HEAD", "ref: refs/heads/main\n")

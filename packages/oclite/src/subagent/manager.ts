@@ -81,7 +81,7 @@ export function make(deps: { start: RuntimeShape["start"]; store: SessionStoreSh
             session_id: entry.info.id,
             agent: entry.input.agent,
             prompt: entry.input.prompt,
-            model: entry.input.model,
+            model: entry.input.model ?? parent.model, // Runtime.start: agent.model > this > cfg.model
             permissionMode: entry.input.permissionMode,
             cwd: parent.cwd,
             parent: { session_id: parent.session_id, depth: parent.depth, ruleset: parent.ruleset, call_id: parent.call_id },
@@ -129,7 +129,7 @@ export function make(deps: { start: RuntimeShape["start"]; store: SessionStoreSh
           ).pipe(Effect.tap((reply) => Effect.sync(() => void (reply === "reject" && asked.denied++)))),
       }).pipe(Scope.provide(scope))
       const id = yield* client.spawn({ agent: agent.name, prompt: entry.input.prompt, background: true, permission_mode: entry.input.permissionMode,
-        model: entry.input.model, parent_rules: parent.ruleset, parent_session_id: parent.session_id })
+        model: entry.input.model ?? parent.model, parent_rules: parent.ruleset, parent_session_id: parent.session_id })
         .pipe(Effect.onError(() => Scope.close(scope, Exit.void)))
       const started_at = Date.now()
       const tokens = { input: 0, output: 0, estimated: true }

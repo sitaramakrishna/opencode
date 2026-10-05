@@ -8,7 +8,6 @@
   "skill": "Load a listed skill's instructions by name.",
   "task": "Run a sub-agent (subagent_type) on a self-contained prompt: goal, known facts, exact paths, expected output. background=true returns at once; task_id resumes.",
   "todowrite": "Replace the todo list for multi-step work: each item has content, status and priority; keep one in_progress.",
-  "tool_search": "Find MCP tools by keyword; matches load next turn.",
   "webfetch": "Fetch a URL as markdown (default), text or html.",
   "write": "Create or overwrite filePath with content. Prefer edit for changes."
 }

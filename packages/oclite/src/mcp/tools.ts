@@ -115,11 +115,14 @@ export function searchTool(input: {
   search: (query: string, limit: number) => Effect.Effect<ReadonlyArray<{ name: string; description: string }>>
   maxChars: number | undefined
   activate: (names: string[]) => Effect.Effect<string[]>
+  /** deferredIndex of the run's MCP tools; fixed for the run, so the tool definition stays byte-stable. */
+  index?: string
 }): OcliteTool {
   return {
     name: "tool_search",
     tool: Tool.make({
-      description: "Find MCP tools by keyword (limit 1-10, default 5); matches become callable next turn.",
+      // Deferred profiles only; profiles/tools.*.json leave tool_search out so this text (and the index) is used as is.
+      description: ["Find MCP tools by keyword; matches load next turn.", input.index].filter(Boolean).join(" "),
       jsonSchema: SEARCH_SCHEMA,
       execute: (raw) =>
         Effect.gen(function* () {
@@ -140,6 +143,33 @@ export function searchTool(input: {
 /** Deferred profiles add `tool_search`; the registry keeps `mcp__*` out of the request until activated. */
 export function forProfile(profile: Profile, tools: readonly OcliteTool[], search: () => OcliteTool) {
   return !tools.length ? [] : profile.mcp === "deferred" ? [...tools, search()] : [...tools]
+}
+
+/**
+ * Deferred profiles: the MCP tool names per server, in the tool_search description, so a small model knows what it
+ * can load (it doesn't search for tools it can't see). Sorted, so it's byte-stable; over `cap`, counts per server.
+ */
+export function deferredIndex(names: readonly string[], cap = 400) {
+  const servers = new Map<string, string[]>()
+  names.toSorted().forEach((name) => {
+    const rest = name.slice("mcp__".length)
+    const server = rest.slice(0, Math.max(0, rest.indexOf("__")))
+    servers.set(server, [...(servers.get(server) ?? []), rest.slice(server.length + 2)])
+  })
+  if (!servers.size) return undefined
+  const head = "Tools:"
+  const full = `${head} ${[...servers].map((entry) => `${entry[0]}: ${entry[1].join(", ")}`).join("; ")}`
+  if (full.length <= cap) return full
+  return `${head} ${[...servers].map((entry) => `${entry[0]} (${entry[1].length} tools)`).join("; ")}`
+}
+
+/** A prompt naming a server as MCP (`git mcp`, `mcp server git`, `mcp__git__…`) activates its tools from turn one. */
+export function namedServers(prompt: string, names: readonly string[]) {
+  return names.filter((name) => {
+    // Wire names are sanitized to [A-Za-z0-9_-], so the server part needs no regex escaping.
+    const server = name.slice("mcp__".length).split("__")[0]!
+    return new RegExp(`\\b${server}\\s+mcp\\b|\\bmcp\\s+(server\\s+)?${server}\\b|\\bmcp__${server}__`, "i").test(prompt)
+  })
 }
 
 /** Keyword score: each query word found in the name counts 2, in the description 1. */
@@ -204,6 +234,7 @@ export function mcpForRun(
       searchTool({
         search: mcp.search,
         maxChars: profile.descriptionMaxChars,
+        index: deferredIndex(all.map((tool) => tool.name)),
         activate: (names) =>
           Effect.gen(function* () {
             yield* bound.tools?.activate(names) ?? Effect.void
@@ -214,11 +245,15 @@ export function mcpForRun(
     return {
       extra: forProfile(profile, all, search),
       readOnly: all.filter((tool) => tool.readOnly).map((tool) => tool.name),
-      bind: (tools: ToolSet, activated: readonly string[]) =>
+      bind: (tools: ToolSet, activated: readonly string[], prompt = "") =>
         Effect.gen(function* () {
           bound.tools = tools
-          if (activated.length) yield* tools.activate([...activated])
-          const requested = profile.mcp === "deferred" ? activated : all.map((tool) => tool.name)
+          const visible = all.map((tool) => tool.name).filter((name) => name in tools.tools)
+          const deferred = profile.mcp === "deferred" && "tool_search" in tools.tools
+          const named = deferred ? namedServers(prompt, visible).filter((name) => !activated.includes(name)) : []
+          if (named.length) yield* persist(named)
+          if (activated.length || named.length) yield* tools.activate([...activated, ...named])
+          const requested = profile.mcp === "deferred" ? [...activated, ...named] : visible
           return yield* fresh(yield* mcp.instructions(requested.filter((name) => name in tools.tools)))
         }),
     }

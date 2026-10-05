@@ -34,6 +34,10 @@ Phase 7 profile changes, on 2026-09-28, with Bun 1.3.10 on darwin.
 
 "Before" is the Phase 3–6 profile text. "After" is the Phase 7 rewrite, which only touches `src/profile/*`.
 
+The deferred-tool index in the `tool_search` description (names of the deferred MCP tools) adds about 12 tok with the
+6-tool test fixture: local + MCP 1011 → 1026 (−3 for the shorter search sentence), local + `task` + MCP 1184 → 1198,
+local-min + MCP 480 → 495. It costs about as much per tool name as it lists, capped at 400 chars (~100 tok).
+
 The opencode baseline is ≈ 7,260 tok. The `default` profile sends opencode's own texts byte for byte:
 `session/prompt/default.txt` (8,528 chars, since an unknown local model id falls back to it) and the tool `.txt`
 files. Those are bash via `ShellPrompt.render` (4,629), edit 1,369, read 1,158, task 2,305, todowrite 2,012,

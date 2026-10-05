@@ -3,7 +3,8 @@ import fs from "fs/promises"
 import path from "path"
 import { registerSecret } from "../../src/util/redact"
 import { tmpdir } from "../lib/tmp"
-import { config, scriptedAsker, tempDataHome, toolset } from "./harness"
+import { PROFILES } from "../../src/profile/profiles"
+import { CAPS, config, scriptedAsker, tempDataHome, toolset } from "./harness"
 import type { AskRequest } from "../../src/contract"
 
 const data = tempDataHome()
@@ -89,6 +90,21 @@ describe("truncation", () => {
     expect(result.text).toContain("bytes truncated")
     expect(result.overflow_path).toBeDefined()
     expect(Buffer.byteLength(result.text)).toBeLessThan(52 * 1024)
+  })
+
+  test("a 16k context caps a 320 KB result at 15% of the window (local profile), full text in the overflow file", async () => {
+    await using dir = await tmpdir({
+      files: { "huge.txt": Array.from({ length: 4000 }, (_, i) => String(i).padStart(79, "0")).join("\n") },
+    })
+    const tools = await toolset(config(dir.path), { caps: { ...CAPS, context_window: 16384 }, profile: PROFILES.local })
+    const result = await tools.call("read", { filePath: "huge.txt", limit: 4000 })
+    expect(tools.set.context.tokens).toBe(16384)
+    const kept = result.text.slice(0, result.text.indexOf("\n\n..."))
+    expect(Buffer.byteLength(kept)).toBeLessThanOrEqual(Math.floor(16384 * 0.15 * 4))
+    expect(Buffer.byteLength(kept)).toBeGreaterThan(9000)
+    expect(result.text).toContain("Use Grep to search the full content or Read with offset/limit")
+    expect(Buffer.byteLength(result.text)).toBeLessThan(10 * 1024 + 400)
+    expect(await Bun.file(result.overflow_path!).text()).toContain(`4000: ${"3999".padStart(79, "0")}`)
   })
 
   test("a hostile call id can't move the overflow file out of tool-output", async () => {

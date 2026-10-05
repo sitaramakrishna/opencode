@@ -1,6 +1,6 @@
 import path from "path"
 import { Effect, Exit, Schema } from "effect"
-import type { RunToolContext } from "../contract"
+import type { ResolvedConfig, RunToolContext } from "../contract"
 import { childEnv, killGroup, track } from "../hooks/hooks"
 import { mentionsEnv } from "../permission/permission"
 import { define } from "./fs"
@@ -35,8 +35,14 @@ const Parameters = Schema.Struct({
   }),
 })
 
-export function bashTool(ctx: RunToolContext) {
+const warned = { rtk: false }
+
+export function bashTool(ctx: RunToolContext, setting: ResolvedConfig["rtk"] = "auto") {
   const workdir = (dir: string | undefined) => path.resolve(ctx.cwd, dir ?? ".")
+  // Resolved once per run. A rewritten command runs with this binary's dir first on PATH, so it calls the same rtk.
+  const rtk = setting === false ? undefined : (Bun.which("rtk", { PATH: process.env.PATH ?? "" }) ?? undefined)
+  const notice = (message: string) =>
+    ctx.sink({ session_id: ctx.session_id, agent_path: [ctx.agent.name], type: "status", phase: "notice", message })
   return define({
     name: "bash",
     parameters: Parameters,
@@ -51,29 +57,50 @@ export function bashTool(ctx: RunToolContext) {
     summarize: (params) => `bash ${params.command.split("\n")[0].slice(0, 80)}`,
     paths: (params) => [{ path: workdir(params.workdir), kind: "directory" }],
     envFiles: (params) => (mentionsEnv(params.command) ? [".env"] : []),
+    // Permission and PreToolUse already ran on the model's command; the rtk rewrite happens only after approval.
     execute: (params) =>
-      Effect.acquireUseRelease(
-        // Own process group (detached) so a timeout or cancel reaches every child, not just the shell.
-        Effect.sync(() => {
-          const proc = Bun.spawn([SHELL, "-c", `exec 2>&1\n${params.command}`], {
-            cwd: workdir(params.workdir),
-            env: childEnv(),
-            stdin: "ignore",
-            stdout: "pipe",
-            detached: true,
-          })
-          track(proc)
-          return proc
-        }),
-        (proc) =>
-          Effect.promise(async () => {
-            const [output, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited])
-            const text = output.trimEnd() || "(no output)"
-            return code === 0 ? text : `${text}\n\n(exit code ${code})`
-          }),
-        (proc, exit) => Effect.sync(() => (Exit.isSuccess(exit) ? undefined : killGroup(proc.pid))),
-      ),
+      Effect.gen(function* () {
+        if (setting === true && !rtk && !warned.rtk) {
+          warned.rtk = true
+          yield* notice("rtk: true but rtk is not on PATH; running commands unchanged")
+        }
+        const command = rtk
+          ? yield* Effect.promise(() => rewrite(rtk, params.command).catch(() => params.command))
+          : params.command
+        const env = childEnv()
+        if (rtk && command !== params.command) {
+          yield* notice(`rtk: ${params.command} → ${command}`)
+          env.PATH = `${path.dirname(rtk)}${path.delimiter}${env.PATH ?? ""}`
+        }
+        return yield* run(command, workdir(params.workdir), env)
+      }),
   })
+}
+
+function run(command: string, cwd: string, env: Record<string, string | undefined>) {
+  return Effect.acquireUseRelease(
+    // Own process group (detached) so a timeout or cancel reaches every child, not just the shell.
+    Effect.sync(() => {
+      const proc = Bun.spawn([SHELL, "-c", `exec 2>&1\n${command}`], { cwd, env, stdin: "ignore", stdout: "pipe", detached: true })
+      track(proc)
+      return proc
+    }),
+    (proc) =>
+      Effect.promise(async () => {
+        const [output, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited])
+        const text = output.trimEnd() || "(no output)"
+        return code === 0 ? text : `${text}\n\n(exit code ${code})`
+      }),
+    (proc, exit) => Effect.sync(() => (Exit.isSuccess(exit) ? undefined : killGroup(proc.pid))),
+  )
+}
+
+// `rtk rewrite` prints the rtk form and exits 0, or exits 1 silently; non-zero, empty, a 2 s timeout or a spawn
+// error all keep the original command.
+async function rewrite(rtk: string, command: string) {
+  const proc = Bun.spawn([rtk, "rewrite", command], { env: childEnv(), stdin: "ignore", stdout: "pipe", stderr: "ignore", timeout: 2000 })
+  const [output, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited])
+  return code === 0 && output.trim() ? output.trim() : command
 }
 
 // `always` for a simple command covers the same command and subcommand: `git status -s` → `git status *`.

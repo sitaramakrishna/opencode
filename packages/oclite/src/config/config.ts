@@ -11,7 +11,7 @@ import { AppConfig, ConfigError, type HookEntry, type ResolvedConfig } from "../
 import { substitute } from "../forked/variable"
 import { configDir, projectRoot } from "../util/paths"
 import { argSecrets, registerEnvSecrets, registerSecret, urlSecrets } from "../util/redact"
-import { claudeTool, decode, fromConfig, loadAgents, mergeDeep, untrust } from "./agents"
+import { claudeTool, decode, fromConfig, loadAgents, mergeDeep, moveToolList, untrust } from "./agents"
 
 export const DEFAULT_MODEL = "anthropic/claude-sonnet-5"
 const HOOK_TIMEOUT_MS = 10_000
@@ -58,6 +58,9 @@ const Provider = Schema.Struct({
       baseURL: Schema.optional(Schema.String),
       apiKey: Schema.optional(Schema.String),
       headers: Schema.optional(Schema.Record(Schema.String, Schema.String)),
+      // opencode's streaming timeouts, ms; false = off (defaults in llm/client.ts streamTimeouts).
+      headerTimeout: Schema.optional(Schema.Union([Count, Schema.Literal(false)])),
+      chunkTimeout: Schema.optional(Schema.Union([Count, Schema.Literal(false)])),
     }),
   ),
   models: Schema.optional(
@@ -101,6 +104,13 @@ export const Info = Schema.Struct({
   ),
   permission_timeout_ms: Schema.optional(Count),
   subagent: Schema.optional(Schema.Struct({ max_depth: Schema.optional(Count), max_concurrent: Schema.optional(Count) })),
+  rtk: Schema.optional(Schema.Union([Schema.Literal("auto"), Schema.Boolean])),
+  style: Schema.optional(
+    Schema.Struct({
+      caveman: Schema.optional(Schema.Literals(["off", "lite", "full", "ultra"])),
+      scope: Schema.optional(Schema.Literals(["subagents", "all"])),
+    }),
+  ),
 })
 export type Info = typeof Info.Type
 
@@ -138,7 +148,8 @@ export interface Trust {
   /** The project hash when trusted, so a transport:mcp child is trusted only while the project is unchanged. */
   hash?: string
 }
-export type LoadedConfig = ResolvedConfig & { trust: Trust }
+/** `userBaseURL`: provider baseURLs from the user layer, the only overrides that may receive a looked-up credential. */
+export type LoadedConfig = ResolvedConfig & { trust: Trust; userBaseURL: Record<string, string> }
 
 export function load(args: CliArgs, ctx: LoadContext = {}): Effect.Effect<LoadedConfig, ConfigError> {
   return Effect.tryPromise({
@@ -202,7 +213,10 @@ async function resolve(args: CliArgs, ctx: LoadContext): Promise<LoadedConfig> {
     showThinking: !args.noThinking,
     appendSystemPrompt: args.appendSystemPrompt,
     maxTurns: args.maxTurns,
+    rtk: merged.rtk ?? "auto",
+    style: { caveman: merged.style?.caveman ?? "off", scope: merged.style?.scope ?? "subagents" },
     trust: { root, trusted, skipped: [...skipped], hash: trusted ? await projectHash(root) : undefined },
+    userBaseURL: Object.fromEntries(Object.entries(files[0].provider ?? {}).flatMap(([id, item]) => (item.options?.baseURL ? [[id, item.options.baseURL.replace(/\/+$/, "")]] : []))),
   }
 }
 
@@ -222,7 +236,7 @@ async function readUntrusted(file: string, base: string, skipped: Set<string>): 
   // untrust() drops permission allows (and would drop agent-style transport keys, which a config never has).
   const kept = untrust(cut, skipped)
   if (isRecord(kept.agent))
-    kept.agent = Object.fromEntries(Object.entries(kept.agent).map(([name, agent]) => [name, isRecord(agent) ? untrust(agent, skipped) : agent]))
+    kept.agent = Object.fromEntries(Object.entries(kept.agent).map(([name, agent]) => [name, isRecord(agent) ? moveToolList(untrust(agent, skipped)) : agent]))
   return withInstructions(decode(Info, kept, file), base, base, skipped)
 }
 
@@ -280,7 +294,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export async function readConfig(file: string, base: string): Promise<Info> {
   const raw = await readJson(file)
   if (raw === undefined) return {}
-  return withInstructions(decode(Info, raw, file), base)
+  // `agent.<name>.tools: [task, webfetch]` (the frontmatter list form) decodes like a markdown agent's.
+  const agents = isRecord(raw) && isRecord(raw.agent) ? raw.agent : undefined
+  const normalized = agents
+    ? { ...raw, agent: Object.fromEntries(Object.entries(agents).map(([name, agent]) => [name, isRecord(agent) ? moveToolList(agent) : agent])) }
+    : raw
+  return withInstructions(decode(Info, normalized, file), base)
 }
 
 /** Resolves instruction paths; drops `.env` files always and, for an untrusted layer, anything outside `contain`. */

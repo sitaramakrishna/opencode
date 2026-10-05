@@ -113,6 +113,30 @@ describe("config", () => {
     expect(cfg.provider.local!.models!.qwen).toEqual({ reasoning: true, options: { reasoning_effort: "low" } } as never)
   })
 
+  test("provider headerTimeout / chunkTimeout (opencode's names): ms or false", async () => {
+    await using env = await setup({
+      user: { provider: { local: { options: { baseURL: "http://127.0.0.1:8080/v1", headerTimeout: 3_600_000, chunkTimeout: false } } } },
+    })
+    expect((await env.load()).provider.local!.options).toMatchObject({ headerTimeout: 3_600_000, chunkTimeout: false })
+    await using bad = await setup({ user: { provider: { local: { options: { headerTimeout: "soon" } } } } })
+    expect(String(await bad.fail())).toContain("headerTimeout")
+  })
+
+  test("agent.<name>.tools as a list (frontmatter form) works in config.json; the record form still decodes", async () => {
+    await using env = await setup({
+      user: { agent: { build: { tools: ["task", "todowrite"] }, plan: { tools: { bash: false } } } },
+    })
+    const cfg = await env.load()
+    expect(cfg.agents.build.tools).toEqual(["task", "todowrite"])
+    expect(cfg.agents.plan.permission).toContainEqual({ permission: "bash", pattern: "*", action: "deny" })
+    // Untrusted project config: the list is kept (optional tools still ask), a `{bash: true}` allow is dropped.
+    await using untrusted = await setup({ project: { agent: { build: { tools: ["webfetch"] }, plan: { tools: { bash: true } } } } })
+    const cut = await untrusted.load({ trustProject: false })
+    expect(cut.agents.build.tools).toEqual(["webfetch"])
+    expect(cut.agents.plan.permission).not.toContainEqual({ permission: "bash", pattern: "*", action: "allow" })
+    expect(cut.trust.skipped).toContain("permission allows")
+  })
+
   test("{env:} and {file:} substitution", async () => {
     await using env = await setup({
       project: { small_model: "{env:HOME}", model: "{file:model.txt}" },

@@ -2,11 +2,15 @@
 // `delta.reasoning` fetch shim, usage estimation, the process-wide per-server queue and the <think> splitter.
 import { Effect, Layer, Option, Schema, Semaphore, Stream } from "effect"
 import { FetchHttpClient, type HttpClient } from "effect/unstable/http"
-import { Auth, LLM, LLMClient, LLMError, type LLMEvent, type LLMRequest, Message, ProviderInternalReason, Usage } from "@opencode-ai/llm"
+import { Auth, LLM, LLMClient, LLMError, type LLMEvent, type LLMRequest, Message, ProviderInternalReason, TransportReason, Usage } from "@opencode-ai/llm"
 import { RequestExecutor } from "@opencode-ai/llm/route"
+import type { Provider } from "opencode/provider/provider"
 import { AppConfig, ConfigError, LlmGateway, type ModelHandle, type ResolvedConfig, type TokenUsage, type TurnRequest } from "../contract"
+import type { LoadedConfig } from "../config/config"
 import { isLoopback } from "../util/paths"
-import { redactUrl } from "../util/redact"
+import { redactUrl, registerSecret } from "../util/redact"
+import { type CatalogProvider, catalog } from "./catalog"
+import { credential, login, remoteConfig } from "./opencode-auth"
 import { type CapabilityRecord, OPTIONAL, persist, probe, staticRecord } from "./probe"
 import { splitThink } from "./think"
 
@@ -38,8 +42,11 @@ const make = Effect.gen(function* () {
         const request = build(handle, req, effort(cfg, handle.ref))
         const input = caps.usage_in_stream ? 0 : yield* estimateInput(handle, request)
         const seen = { finish: false, out: 0 }
+        const limits = streamTimeouts(cfg, handle)
+        const fired: { kind?: "header" | "chunk" } = {}
+        const timed = withTimeouts(globalThis.fetch, limits, (kind) => (fired.kind = kind))
         const base = client.stream(request).pipe(
-          caps.reasoning_field === "reasoning" ? Stream.provideService(FetchHttpClient.Fetch, renameReasoning(globalThis.fetch)) : (s) => s,
+          Stream.provideService(FetchHttpClient.Fetch, caps.reasoning_field === "reasoning" ? renameReasoning(timed) : timed),
         )
         return (caps.think_tags && caps.reasoning_field === "none" ? splitThink(base) : base).pipe(
           Stream.tap((event) =>
@@ -63,6 +70,8 @@ const make = Effect.gen(function* () {
             const patch = { accepts: Object.fromEntries(params.map((param) => [param, false])) }
             return Stream.unwrap(persist(handle.baseURL, handle.model.id, patch, "error-400").pipe(Effect.as(attempt(handle, req, false))))
           }),
+          // Whatever the aborted fetch or body surfaced as, a fired timer is reported as a Timeout transport error.
+          Stream.catchCause((cause) => (fired.kind ? Stream.fail(timeoutError(handle, fired.kind, limits)) : Stream.failCause(cause))),
         )
       }),
     )
@@ -106,42 +115,81 @@ function resolveModel(cfg: ResolvedConfig, ref: string, reprobe: boolean) {
     const options = entry.options ?? {}
     const limits = entry.models?.[modelID]
     const base = options.baseURL?.replace(/\/+$/, "")
-    const pins = base ? cfg.servers[base] : undefined
-    const hosted = providerID === "anthropic" || entry.npm === "@ai-sdk/anthropic" ? "anthropic" : providerID === "openai" && !base ? "openai" : undefined
-    if (!hosted && !base) return yield* new ConfigError({ message: `provider "${providerID}" has no options.baseURL and is not anthropic/openai` })
-    const baseURL = base ?? (hosted === "anthropic" ? "https://api.anthropic.com/v1" : "https://api.openai.com/v1")
-    const model = yield* Effect.promise(() => modelFor(hosted, { baseURL: base, apiKey: options.apiKey, headers: options.headers, provider: providerID }, modelID))
-    const capabilities: CapabilityRecord = hosted
-      ? staticRecord(baseURL, modelID, { ...pins, context_window: pins?.context_window ?? limits?.limit?.context })
+    const stock = (yield* Effect.promise(() => catalog()))[providerID]
+    // A login for integration `opencode` (no config apiKey or env key beating it) asks /api/config what applies to it.
+    const signedIn = providerID === "opencode" && !options.apiKey && !(stock?.env ?? []).some((item) => process.env[item]) ? yield* login() : undefined
+    const remote = signedIn ? yield* remoteConfig(signedIn) : undefined
+    const item = remote?.providers?.[providerID]
+    const patch = item?.models?.[modelID]
+    const known = item ? { ...stock, npm: item.npm ?? stock?.npm, api: item.api ?? stock?.api, models: { ...stock?.models } } satisfies CatalogProvider : stock
+    const listed = patch ? { ...known?.models?.[modelID], id: patch.id ?? known?.models?.[modelID]?.id, limit: patch.limit ?? known?.models?.[modelID]?.limit, cost: patch.cost ?? known?.models?.[modelID]?.cost,
+      reasoning: known?.models?.[modelID]?.reasoning ?? patch.reasoning, provider: patch.provider ? { npm: patch.provider.npm ?? item?.npm, api: patch.provider.api ?? item?.api } : known?.models?.[modelID]?.provider } : known?.models?.[modelID]
+    const api = (listed?.provider?.api ?? known?.api)?.replace(/\/+$/, "")
+    // The catalog picks npm and limits only while requests go to its own URL; another baseURL is a server you set up.
+    const listedURL = Boolean(known) && (!base || base === api)
+    const anthropic = providerID === "anthropic" || entry.npm === "@ai-sdk/anthropic"
+    // A loopback server you configured keeps today's behaviour: probed openai-compatible, only its own apiKey.
+    const loopback = Boolean(base) && !listedURL && !anthropic && isLoopback(base ?? "")
+    const npm = loopback ? COMPATIBLE_NPM : entry.npm ?? (listedURL ? listed?.provider?.npm ?? known?.npm : undefined)
+      ?? (anthropic ? "@ai-sdk/anthropic" : providerID === "openai" && !base ? "@ai-sdk/openai" : base ? COMPATIBLE_NPM : undefined)
+    if (!npm) return yield* new ConfigError({ message: `provider "${providerID}" has no options.baseURL, is not anthropic/openai and is not in opencode's models.dev catalog` })
+    if (!NPM.includes(npm)) return yield* new ConfigError({ message: `provider "${providerID}": npm package "${npm}" is not supported by oclite (supported: ${NPM.join(", ")})` })
+    const target = base ?? api
+    if (npm === COMPATIBLE_NPM && !target) return yield* new ConfigError({ message: `provider "${providerID}" has no options.baseURL` })
+    const probed = npm === COMPATIBLE_NPM && !listedURL
+    const found = loopback ? undefined : yield* credential(providerID, [...(known?.env ?? []), ...(ENV[npm] ?? [])], options.apiKey)
+    // A looked-up credential goes only to the catalog's own URL or a baseURL from the user config, never a project one.
+    if (found?.stored && !listedURL && base && base !== (cfg as Partial<LoadedConfig>).userBaseURL?.[providerID])
+      return yield* new ConfigError({ message: `provider "${providerID}": not sending your ${found.source} credential to ${redactUrl(base)}, a baseURL from project config; set it in user config or set options.apiKey` })
+    // What /api/config declared for this URL (opencode: provider and model headers; body options without credentials).
+    const declared = listedURL && item ? { ...item.options?.headers as Record<string, string> | undefined, ...patch?.headers } : {}
+    Object.values(declared).forEach(registerSecret)
+    const headers = { ...declared, ...options.headers }
+    const body = listedURL && item ? Object.fromEntries(Object.entries({ ...item.options, ...patch?.options }).filter((entry) => entry[0] !== "apiKey" && entry[0] !== "headers")) : {}
+    const apiKey = found?.key ?? (loopback ? options.apiKey : providerID === "opencode" ? "public" : undefined)
+    const pins = target ? cfg.servers[target] : undefined
+    const context = pins?.context_window ?? limits?.limit?.context ?? (listedURL ? listed?.limit?.context : undefined)
+    // opencode caps requested output at 32k whatever the catalog says.
+    const output = limits?.limit?.output ?? (listedURL && listed?.limit?.output ? Math.min(listed.limit.output, 32_000) : undefined)
+    const model = yield* Effect.promise(() => modelFor(npm, probed, { baseURL: target, apiKey, headers, provider: providerID, id: listedURL ? listed?.id ?? modelID : modelID, context, output }))
+    const baseURL = target ?? (anthropic ? "https://api.anthropic.com/v1" : npm === "@ai-sdk/openai" ? "https://api.openai.com/v1" : model.route.endpoint?.baseURL ?? `npm:${npm}`)
+    const record = probed ? undefined : staticRecord(baseURL, modelID, { ...pins, context_window: context })
+    const capabilities: CapabilityRecord = record
+      ? { ...record, npm, auth: found ? found.source + (remote?.label ?? "") : apiKey === "public" ? "public" : "none", ...(Object.keys(headers).length ? { headers: Object.keys(headers) } : {}),
+          accepts: npm === COMPATIBLE_NPM && record.sources.accepts === "static" ? { ...record.accepts, chat_template_kwargs: false } : record.accepts }
       : yield* Effect.scoped(
           permit(queueFor(baseURL, pins?.concurrency ?? pins?.capabilities?.concurrency ?? (isLoopback(baseURL) ? 1 : 8)), "probe", () => Effect.void).pipe(
-            Effect.andThen(probe({ baseURL, model: modelID, apiKey: options.apiKey, headers: options.headers, reprobe,
-              pins: { ...pins, context_window: pins?.context_window ?? limits?.limit?.context } })),
+            Effect.andThen(probe({ baseURL, model: modelID, apiKey, headers, reprobe, pins: { ...pins, context_window: context } })),
           ),
         )
-    const reasoning = limits?.reasoning ?? (!hosted && (capabilities.reasoning_field !== "none" || capabilities.think_tags))
+    const reasoning = limits?.reasoning ?? (probed ? capabilities.reasoning_field !== "none" || capabilities.think_tags : listedURL && listed?.reasoning === true)
     return {
-      ref, model, baseURL, capabilities, reasoning,
-      local: !hosted && isLoopback(baseURL),
+      ref, model, baseURL, capabilities, reasoning, body,
+      local: probed && isLoopback(baseURL),
       contextWindow: capabilities.context_window,
-      maxTokens: pins?.max_tokens ?? Math.max(reasoning ? 8192 : 0, limits?.limit?.output ?? 4096),
+      maxTokens: pins?.max_tokens ?? Math.max(reasoning ? 8192 : 0, output ?? 4096),
     } satisfies ModelHandle
   })
 }
 
-async function modelFor(hosted: "anthropic" | "openai" | undefined, input: { baseURL?: string; apiKey?: string; headers?: Record<string, string>; provider: string }, id: string) {
-  if (hosted === "anthropic") {
-    const { configure } = await import("@opencode-ai/llm/providers/anthropic")
-    return configure({ baseURL: input.baseURL, apiKey: input.apiKey, headers: input.headers }).model(id)
-  }
-  if (hosted === "openai") {
-    const { configure } = await import("@opencode-ai/llm/providers/openai")
-    return configure({ apiKey: input.apiKey, headers: input.headers }).model(id)
+const COMPATIBLE_NPM = "@ai-sdk/openai-compatible"
+// What LLMNative.model maps (opencode's session/llm/native-request.ts), plus the default env key per package.
+const NPM = [COMPATIBLE_NPM, "@ai-sdk/openai", "@ai-sdk/azure", "@ai-sdk/anthropic", "@ai-sdk/google", "@ai-sdk/amazon-bedrock", "@openrouter/ai-sdk-provider"]
+const ENV: Record<string, string[]> = { "@ai-sdk/anthropic": ["ANTHROPIC_API_KEY"], "@ai-sdk/openai": ["OPENAI_API_KEY"] }
+
+type ModelInput = { baseURL?: string; apiKey?: string; headers?: Record<string, string>; provider: string; id: string; context?: number; output?: number }
+
+async function modelFor(npm: string, probed: boolean, input: ModelInput) {
+  if (!probed) {
+    // Lazy: opencode's session code is loaded only for hosted models (startup stays fast for local servers).
+    const native = await import("opencode/session/llm/native-request")
+    const model = { providerID: input.provider, id: input.id, api: { id: input.id, npm, url: input.baseURL ?? "" }, headers: {}, limit: { context: input.context ?? 0, output: input.output ?? 0 } }
+    return native.LLMNative.model({ model: model as unknown as Provider.Model, apiKey: input.apiKey, baseURL: input.baseURL, messages: [] }, input.headers)
   }
   const { configure } = await import("@opencode-ai/llm/providers/openai-compatible")
   // Local servers rarely need a key; without one send no Authorization header instead of failing on a missing credential.
   const auth = input.apiKey ? { apiKey: input.apiKey } : { auth: Auth.none }
-  return configure({ baseURL: input.baseURL ?? "", headers: input.headers, provider: input.provider, ...auth }).model(id)
+  return configure({ baseURL: input.baseURL ?? "", headers: input.headers, provider: input.provider, ...auth }).model(input.id)
 }
 
 /** Optional params are sent only when the capability record says the server accepts them (openai-compatible only). */
@@ -156,12 +204,12 @@ function build(handle: ModelHandle, req: TurnRequest, reasoningEffort: string | 
   const caps = handle.capabilities
   const compatible = handle.model.route.id === COMPATIBLE
   const thinking = req.thinking
-  const body: Record<string, unknown> = compatible ? {
+  const body: Record<string, unknown> = { ...handle.body, ...(compatible ? {
     ...(caps.accepts.chat_template_kwargs && thinking !== undefined ? { chat_template_kwargs: { enable_thinking: thinking } } : {}),
     ...(caps.accepts.prompt_cache_key ? { prompt_cache_key: req.session_id } : {}),
     ...(caps.accepts.reasoning_effort && reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
     ...(caps.accepts.parallel_tool_calls && req.tools.length > 0 ? { parallel_tool_calls: false } : {}),
-  } : {}
+  } : {}) }
   // `/no_think` is model-specific (Qwen templates): only when pinned, and only when enable_thinking can't be sent.
   const suffix = compatible && caps.no_think_suffix && thinking === false && !caps.accepts.chat_template_kwargs
   return LLM.request({
@@ -204,6 +252,63 @@ function permit(queue: Queue, label: string, onQueued: (behind: string) => Effec
       { interruptible: true },
     )
   })
+}
+
+type Limits = { header: number | false; chunk: number | false }
+
+/**
+ * opencode's `provider.<id>.options.headerTimeout` / `chunkTimeout` (ms, false = off). Hosted: 300 s each, as in
+ * opencode. Loopback: 30 min to the first byte (llama.cpp sends headers only after prefill, which takes minutes
+ * for a large prompt on a slow model) and 10 min between chunks (a thinking model can go quiet that long).
+ */
+export function streamTimeouts(cfg: ResolvedConfig, handle: Pick<ModelHandle, "ref" | "baseURL">): Limits {
+  const options = cfg.provider[handle.ref.slice(0, Math.max(0, handle.ref.indexOf("/")))]?.options
+  const local = isLoopback(handle.baseURL)
+  return { header: options?.headerTimeout ?? (local ? 1_800_000 : 300_000), chunk: options?.chunkTimeout ?? (local ? 600_000 : 300_000) }
+}
+
+function timeoutError(handle: ModelHandle, kind: "header" | "chunk", limits: Limits) {
+  const provider = handle.ref.slice(0, Math.max(0, handle.ref.indexOf("/")))
+  const url = redactUrl(handle.baseURL)
+  const hint = handle.local ? "prefill of a large prompt on a slow local model can take minutes" : "the server may be overloaded"
+  const message = kind === "header"
+    ? `no response from ${url} within ${Number(limits.header) / 1000} s (${hint}; raise provider.${provider}.options.headerTimeout)`
+    : `stream from ${url} stalled: no data for ${Number(limits.chunk) / 1000} s (raise provider.${provider}.options.chunkTimeout)`
+  return new LLMError({ module: "oclite/llm", method: "stream", reason: new TransportReason({ message, kind: "Timeout", url }) })
+}
+
+/** Header timer until the response arrives, then a chunk timer per body read: any SSE bytes (reasoning too) reset it. */
+function withTimeouts(base: typeof fetch, limits: Limits, fired: (kind: "header" | "chunk") => void): typeof fetch {
+  return Object.assign(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const abort = new AbortController()
+    const signal = init?.signal ? AbortSignal.any([init.signal, abort.signal]) : abort.signal
+    const header = limits.header === false ? undefined : setTimeout(() => {
+      fired("header")
+      abort.abort()
+    }, limits.header)
+    // `timeout: false` turns off Bun's own 300 s fetch timeout; these timers replace it.
+    const res = await base(input, { ...init, signal, timeout: false } as RequestInit).finally(() => clearTimeout(header))
+    const ms = limits.chunk
+    if (ms === false || !res.body) return res
+    const reader = res.body.getReader()
+    const body = new ReadableStream<Uint8Array>({
+      pull: async (controller) => {
+        const part = await new Promise<Awaited<ReturnType<typeof reader.read>>>((resolve, reject) => {
+          const timer = setTimeout(() => {
+            fired("chunk")
+            reject(new Error(`no data for ${ms} ms`))
+            abort.abort()
+            void reader.cancel().catch(() => undefined)
+          }, ms)
+          reader.read().then(resolve, reject).finally(() => clearTimeout(timer))
+        })
+        if (part.done) return controller.close()
+        controller.enqueue(part.value)
+      },
+      cancel: (reason) => reader.cancel(reason),
+    })
+    return new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers })
+  }, { preconnect: base.preconnect })
 }
 
 // vLLM streams `delta.reasoning`; @opencode-ai/llm decodes only `reasoning_content` (ADR). Rename inside SSE lines.

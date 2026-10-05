@@ -1,10 +1,10 @@
 #!/usr/bin/env bun
-// Size budget (SPEC §7): src/**/*.ts ≤ 45 files (forked and .d.ts included) and ≤ 7000 lines excluding src/forked/.
+// Size budget (SPEC §7): src/**/*.ts ≤ 45 files (forked and .d.ts included) and ≤ 7320 lines excluding src/forked/; docs/ADR.md has the raise.
 // Usage: bun run scripts/size-budget.ts [dir]   (dir defaults to packages/oclite/src)
 import path from "path"
 
 const MAX_FILES = 45
-const MAX_LINES = 7000
+const MAX_LINES = 7320
 
 const dir = path.resolve(process.argv[2] ?? path.join(import.meta.dir, "..", "src"))
 const files = (await Array.fromAsync(new Bun.Glob("**/*.ts").scan({ cwd: dir }))).sort()

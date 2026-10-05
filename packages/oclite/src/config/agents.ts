@@ -168,8 +168,8 @@ function claudeCompat(data: Record<string, unknown>) {
 }
 
 // oclite's own `tools: [task, webfetch]` (optional tools for local profiles) is a list, while ConfigAgentV1's
-// deprecated `tools` is a record; move lists into options so they decode as the extension.
-function moveToolList(data: Record<string, unknown>) {
+// deprecated `tools` is a record; move lists into options so they decode as the extension. Config `agent` entries too.
+export function moveToolList(data: Record<string, unknown>) {
   if (!Array.isArray(data.tools)) return data
   const result: Record<string, unknown> = { ...data }
   delete result.tools

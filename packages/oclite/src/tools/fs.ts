@@ -193,16 +193,19 @@ export function attempt<A>(body: (signal: AbortSignal) => Promise<A>) {
   })
 }
 
-/** Cuts output at 2000 lines / 50 KB; the full text goes to tool-output/<session>/<call>.txt, named in the hint. */
-export async function truncate(text: string, session: string, call: string) {
+/**
+ * Cuts output at 2000 lines / `maxBytes` (the registry sizes it from the context window, ≤ 50 KB); the full text goes
+ * to tool-output/<session>/<call>.txt, named in the hint.
+ */
+export async function truncate(text: string, session: string, call: string, maxBytes = MAX_BYTES) {
   const bytes = Buffer.byteLength(text)
   const lines = text.split("\n")
-  if (lines.length <= MAX_LINES && bytes <= MAX_BYTES) return { text, bytes }
+  if (lines.length <= MAX_LINES && bytes <= maxBytes) return { text, bytes }
   const kept: string[] = []
   const size = { bytes: 0, hitBytes: false }
   for (const line of lines.slice(0, MAX_LINES)) {
     const next = Buffer.byteLength(line) + (kept.length ? 1 : 0)
-    if (size.bytes + next > MAX_BYTES) {
+    if (size.bytes + next > maxBytes) {
       size.hitBytes = true
       break
     }

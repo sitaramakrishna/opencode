@@ -34,6 +34,8 @@ export interface LoopDeps {
   persistContext: (handle: ModelHandle, tokens: number) => Effect.Effect<void>
   /** Backoff before retry n (ms); 2/4/8 s in production, scaled down in tests. */
   retryDelays: readonly number[]
+  /** `-p` runs: a call denied DOOM times ends the run at once; the REPL first gets a reminder. */
+  headless: boolean
 }
 
 export interface LoopInput {
@@ -52,6 +54,8 @@ export interface LoopInput {
   steers: () => Effect.Effect<string[]>
   /** Mirrors step/tokens into RunHandle.status. */
   progress: { step: number; tokens: TokenUsage }
+  /** opencode's `doom_loop` permission (default ask) for a call identical to the two before it; false = rejected. */
+  doomLoop: (name: string, input: unknown) => Effect.Effect<boolean>
 }
 
 /** `protocolFailures` counts like a denial (headless exit 3): the text-protocol run gave up on malformed calls. */
@@ -59,6 +63,9 @@ export type LoopResult = Pick<RunResult, "reason" | "text" | "turns" | "usage" |
 
 type Call = { id: string; name: string; input: unknown }
 type Attempt = { text: string; reasoning: string; calls: Call[]; reason: string; usage: TokenUsage }
+
+/** Identical calls before the doom_loop ask, and identical denials before the run stops (REPL: reminder first). */
+const DOOM = 3
 
 /** A stream that ended without a finish event: treated like a transport drop and retried. */
 class Dropped extends Error {}
@@ -82,6 +89,11 @@ export const run = Effect.fn("loop.run")(function* (deps: LoopDeps, input: LoopI
     malformed: false,
     overflowed: false,
     unthought: false,
+    /** `<key>|ran` or `<key>|denied` per executed call; denials per key; the guard's reminders and stop message. */
+    recent: [] as string[],
+    denials: new Map<string, number>(),
+    notes: [] as string[],
+    doomed: undefined as string | undefined,
   }
 
   const end = (reason: LoopResult["reason"], error?: string, protocolFailures?: number) =>
@@ -107,6 +119,7 @@ export const run = Effect.fn("loop.run")(function* (deps: LoopDeps, input: LoopI
         steers: yield* input.steers(),
         envelopes,
         stop: state.stop.splice(0),
+        notes: state.notes.splice(0),
         todos: todos !== state.todos ? before.todos : undefined,
       })
       state.todos = todos
@@ -117,6 +130,8 @@ export const run = Effect.fn("loop.run")(function* (deps: LoopDeps, input: LoopI
       if ("ended" in attempt) return attempt.ended
       state.steps++
       state.fresh = false
+      // One overflow recovery per provider turn, not per run: a later turn can overflow again (e.g. a re-run tool).
+      state.overflowed = false
       input.progress.step = state.steps
       const calls = textProtocol ? yield* textCall(attempt) : attempt.calls
       if (calls === "malformed") continue
@@ -138,6 +153,7 @@ export const run = Effect.fn("loop.run")(function* (deps: LoopDeps, input: LoopI
         continue
       }
       yield* dispatch(calls, state.turn - 1)
+      if (state.doomed) return yield* end("error", state.doomed)
     }
   })
 
@@ -197,7 +213,9 @@ export const run = Effect.fn("loop.run")(function* (deps: LoopDeps, input: LoopI
             state.overflowed = true
             return recoverOverflow(message)
           }
-          if (!retryable(error) || n >= deps.retryDelays.length)
+          // A timeout is retried once at most: re-sending the same huge prompt mostly repeats the wait.
+          const timedOut = error instanceof LLMError && error.reason._tag === "Transport" && error.reason.kind === "Timeout"
+          if (!retryable(error) || n >= deps.retryDelays.length || (timedOut && n >= 1))
             return end("error", message).pipe(Effect.map((ended) => ({ ended })))
           const wait = deps.retryDelays[n]!
           return emit({ type: "status", phase: "retry", message: `retrying: ${message}`, attempt: n + 1, wait_ms: wait }).pipe(
@@ -211,9 +229,12 @@ export const run = Effect.fn("loop.run")(function* (deps: LoopDeps, input: LoopI
 
   function recoverOverflow(message: string) {
     return Effect.gen(function* () {
-      const tokens = Number(message.match(/maximum context length is (\d+)/i)?.[1] ?? 0)
+      // OpenAI/vLLM: "maximum context length is N"; llama.cpp: "available context size (N tokens)", "n_ctx":N.
+      const found = message.match(/maximum context length is (\d+)|available context size \((\d+) tokens\)|"n_ctx":\s*(\d+)/i)
+      const tokens = Number(found?.slice(1).find(Boolean) ?? 0)
       if (tokens > 0) {
         state.handle = { ...state.handle, contextWindow: tokens }
+        input.tools.context.tokens = Math.min(input.tools.context.tokens, tokens)
         yield* deps.persistContext(state.handle, tokens)
       }
       const compacted = yield* maybe({ ...compactInput(), turn: state.turn }, true).pipe(Effect.result)
@@ -320,14 +341,33 @@ export const run = Effect.fn("loop.run")(function* (deps: LoopDeps, input: LoopI
     return Effect.gen(function* () {
       const summary = summarize(call)
       const started = Date.now()
+      const key = `${call.name} ${JSON.stringify(call.input)}`
       yield* emit({ type: "tool_start", call_id: call.id, name: call.name, summary })
-      const settled = outcome(yield* ToolRuntime.dispatch(input.tools.tools, { type: "tool-call", ...call }))
+      // A rule-denied call isn't asked about: the denial guard below handles it.
+      const looping = state.recent.length >= DOOM - 1 && state.recent.slice(1 - DOOM).every((item) => item === `${key}|ran`)
+      const stopped = looping && !(yield* input.doomLoop(call.name, call.input))
+      const text = `doom_loop: ${summary} repeated ${DOOM} times with identical input; running it again was denied. Do not repeat it.`
+      const settled = stopped
+        ? { status: "denied" as const, text, overflow_path: undefined, bytes: Buffer.byteLength(text) }
+        : outcome(yield* ToolRuntime.dispatch(input.tools.tools, { type: "tool-call", ...call }))
+      state.recent.push(`${key}|${settled.status === "denied" && !stopped ? "denied" : "ran"}`)
+      if (settled.status === "denied") guard(key, call, summary)
       const duration_ms = Date.now() - started
       const status = settled.status
       yield* append({ type: "tool_result", turn, call_id: call.id, name: call.name, status, output: settled.text,
         overflow_path: settled.overflow_path, duration_ms, bytes: settled.bytes })
       yield* emit({ type: "tool_end", call_id: call.id, name: call.name, status, summary, duration_ms, bytes: settled.bytes })
     })
+  }
+
+  /** The same call denied DOOM times: headless stops; the REPL is told not to retry and stops after DOOM more. */
+  function guard(key: string, call: Call, summary: string) {
+    const count = (state.denials.get(key) ?? 0) + 1
+    state.denials.set(key, count)
+    const stop = `${summary} was denied ${count} times with identical input. To allow it: --allowed-tools "${allowHint(call)}" or a permission rule`
+    if (count >= DOOM * 2 || (count === DOOM && deps.headless)) state.doomed = stop
+    if (count === DOOM && !deps.headless)
+      state.notes.push(`The call ${summary} was denied ${DOOM} times. It is denied and must not be retried; take another approach or ask the user.`)
   }
 })
 
@@ -364,6 +404,14 @@ function add(a: TokenUsage, b: TokenUsage): TokenUsage {
     ...(a.cache_read !== undefined || b.cache_read !== undefined ? { cache_read: (a.cache_read ?? 0) + (b.cache_read ?? 0) } : {}),
     estimated: a.estimated || b.estimated,
   }
+}
+
+/** `bash(git log*)` for `git log -1 --pretty=%B`; other tools by name. */
+function allowHint(call: Call) {
+  const command = call.input && typeof call.input === "object" ? (call.input as Record<string, unknown>).command : undefined
+  if (call.name !== "bash" || typeof command !== "string") return call.name
+  const words = command.trim().split(/\s+/)
+  return `bash(${words.slice(0, words.length > 1 && !words[1]!.startsWith("-") ? 2 : 1).join(" ")}*)`
 }
 
 function summarize(call: Call) {

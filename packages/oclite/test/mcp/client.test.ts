@@ -6,7 +6,7 @@ import { stat } from "fs/promises"
 import path from "path"
 import { setup } from "../cli/harness"
 import { reply, type ChatBody } from "../lib/local-server"
-import { sanitize, wireName } from "../../src/mcp/tools"
+import { deferredIndex, namedServers, sanitize, wireName } from "../../src/mcp/tools"
 
 const fixture = path.resolve(import.meta.dir, "../fixture/mcp-everything.ts")
 
@@ -39,6 +39,33 @@ describe("mcp naming", () => {
     expect(wireName("a-very-long-server-name-for-testing", "and_an_even_longer_tool_name_that_overflows_2")).not.toBe(long)
     expect(wireName("s", "x".repeat(57))).toHaveLength(64)
     expect(wireName("s", "x".repeat(56))).toBe(`mcp__s__${"x".repeat(56)}`)
+  })
+})
+
+describe("deferred-tool index", () => {
+  const git = ["status", "log", "diff", "show"].map((tool) => `mcp__git__git_${tool}`)
+  const context7 = ["mcp__context7__resolve-library-id", "mcp__context7__get-library-docs"]
+
+  test("tool names per server, sorted, byte-stable", () => {
+    const text = deferredIndex([...git, ...context7])
+    expect(text).toBe(
+      "Tools: context7: get-library-docs, resolve-library-id; git: git_diff, git_log, git_show, git_status",
+    )
+    expect(deferredIndex([...context7, ...git].reverse())).toBe(text!)
+    expect(deferredIndex([])).toBeUndefined()
+  })
+
+  test("over the cap: server names and tool counts only", () => {
+    const many = Array.from({ length: 40 }, (_, i) => `mcp__big__tool_number_${i}`)
+    const text = deferredIndex([...many, ...context7])!
+    expect(text).toBe("Tools: big (40 tools); context7 (2 tools)")
+    expect(deferredIndex([...git, ...context7], 60)).toContain("git (4 tools)")
+  })
+
+  test("a prompt naming a server as MCP selects its tools", () => {
+    expect(namedServers("Use the git MCP tools to show the last commit", [...git, ...context7])).toEqual(git)
+    expect(namedServers("ask the mcp server context7", [...git, ...context7])).toEqual(context7)
+    expect(namedServers("show git log", [...git, ...context7])).toEqual([])
   })
 })
 
@@ -114,6 +141,33 @@ describe("mcp client (spawned fixture)", () => {
     const resumed = await env.spawn(["-p", "again", "--resume", session, "--profile", "local", "--output-format", "json"])
     expect(resumed.code).toBe(0)
     expect(toolNames(env.server.chats()[2]?.body)).toContain("mcp__fixture__echo")
+  })
+
+  test("deferred index: in the local tool_search description (stable across turns); default sends every schema instead", async () => {
+    await using env = await setup()
+    await withMcp(env)
+    env.server.queue(reply.tool_call({ name: "tool_search", args: { query: "echo" } }), reply.text("found"), reply.text("ok"))
+    expect((await env.spawn(["-p", "find echo", "--profile", "local"])).code).toBe(0)
+    const [first, second] = env.server.chats().map((chat) => chat.body)
+    expect(toolDef(first, "tool_search")?.description).toBe(
+      "Find MCP tools by keyword; matches load next turn. Tools: fixture: add, crash, echo, lookup, slow, write_file",
+    )
+    expect(toolDef(second, "tool_search")?.description).toBe(toolDef(first, "tool_search")!.description)
+    expect((await env.spawn(["-p", "hi", "--profile", "default"])).code).toBe(0)
+    const plain = env.server.chats()[2]?.body
+    expect(toolNames(plain)).not.toContain("tool_search")
+    expect(JSON.stringify(plain)).not.toContain("Tools: fixture")
+  })
+
+  test("deferred: a prompt naming `fixture mcp` sends that server's tools from the first request", async () => {
+    await using env = await setup()
+    await withMcp(env)
+    env.server.queue(reply.text("ok"))
+    expect((await env.spawn(["-p", "use the fixture MCP tools", "--profile", "local"])).code).toBe(0)
+    const first = env.server.chats()[0]?.body
+    expect(toolNames(first)).toContain("mcp__fixture__echo")
+    expect(toolNames(first)).toContain("tool_search")
+    expect(systemOf(first)).toContain("Instructions from MCP server fixture")
   })
 
   test("timeouts: slow past the server timeout is a tool error; progress resets the timeout", async () => {

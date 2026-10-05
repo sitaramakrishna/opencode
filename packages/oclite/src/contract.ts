@@ -23,7 +23,7 @@ export interface AgentDef {                     // structurally assignable to op
 export interface HookEntry { matcher: string; command: string; timeout_ms: number }
 export interface ServerPins { capabilities?: Partial<Omit<Capabilities, "accepts">> & { accepts?: Partial<Capabilities["accepts"]> }; context_window?: number; max_tokens?: number; concurrency?: number; probe_timeout_ms?: number }
 export interface ProviderEntry {
-  npm?: string; options?: { baseURL?: string; apiKey?: string; headers?: Record<string, string> }
+  npm?: string; options?: { baseURL?: string; apiKey?: string; headers?: Record<string, string>; headerTimeout?: number | false; chunkTimeout?: number | false }
   models?: Record<string, { limit?: { context?: number; output?: number }; reasoning?: boolean; options?: Record<string, unknown> }>
 }
 export interface ResolvedConfig {
@@ -42,6 +42,8 @@ export interface ResolvedConfig {
   subagent: { max_depth: number; max_concurrent: number }   // 2, 4
   thinking?: Thinking; showThinking: boolean     // --thinking; --no-thinking → showThinking=false
   appendSystemPrompt?: string; maxTurns?: number
+  rtk?: "auto" | boolean                         // bash rewrite via `rtk rewrite`; undefined = "auto"
+  style?: { caveman: "off" | "lite" | "full" | "ultra"; scope: "subagents" | "all" }   // "off", "subagents"
 }
 export class AppConfig extends Context.Service<AppConfig, ResolvedConfig>()("oclite/AppConfig") {}
 
@@ -63,6 +65,7 @@ export interface Profile {
   tools: readonly string[]; optionalTools: readonly string[]   // optional = enabled via AgentDef.tools
   descriptionMaxChars: number | undefined; mcp: "all" | "deferred"; instructionCapChars: number | undefined
   title: boolean; stubAfterTurns: number; compactAt: number; budgetTokens: number
+  toolOutputShare: number                        // one tool result ≤ share × context window (chars/4), ≤ 50 KB
 }
 
 // ---- render (render/) ----
@@ -113,13 +116,14 @@ export interface OcliteTool {
   timeoutMs: number                              // bash 120000, others 30000, mcp per server
   summarize: (input: unknown) => string          // "read src/x.ts"
 }
-export interface RunToolContext { session_id: string; cwd: string; agent: AgentDef; depth: number; ruleset: PermissionV1.Ruleset; sink: EventSink; profile: Profile }
+export interface RunToolContext { session_id: string; cwd: string; agent: AgentDef; depth: number; ruleset: PermissionV1.Ruleset; sink: EventSink; profile: Profile; model?: string }  // model: this run's resolved ref, inherited by its sub-agents
 export interface ToolSet {
   tools: Record<string, AnyExecutableTool>       // wrapped, keyed by wire name
   definitions: ToolDefinition[]                  // sorted by name, byte-stable
   readOnly: ReadonlySet<string>
   textProtocolPrompt?: string                    // set when tools_native=false (≤ 400 chars + tool list)
   activate: (names: string[]) => Effect.Effect<void>   // tool_search → next request
+  context: { tokens: number }                    // window the output cap is sized from; lowered by a context-overflow 400
 }
 export interface ToolRegistryShape { readonly build: (ctx: RunToolContext, extra: readonly OcliteTool[], caps: Capabilities) => Effect.Effect<ToolSet> }
 export class ToolRegistry extends Context.Service<ToolRegistry, ToolRegistryShape>()("oclite/ToolRegistry") {}
@@ -127,6 +131,7 @@ export class ToolRegistry extends Context.Service<ToolRegistry, ToolRegistryShap
 // ---- llm (llm/) ----
 export interface ModelHandle {
   ref: string; model: Model; local: boolean; baseURL: string
+  body?: Record<string, unknown>                 // extra request body options (hosted: from opencode's /api/config)
   capabilities: Capabilities; contextWindow: number; maxTokens: number; reasoning: boolean
 }
 export interface TurnRequest {
@@ -212,7 +217,7 @@ export interface RunHandle {
   await: Effect.Effect<RunResult>
 }
 export interface SpawnInput {
-  parent: { session_id: string; depth: number; ruleset: PermissionV1.Ruleset; call_id: string; cwd: string }
+  parent: { session_id: string; depth: number; ruleset: PermissionV1.Ruleset; call_id: string; cwd: string; model?: string }
   agent: string; prompt: string; description: string; background: boolean
   task_id?: string; model?: string; permissionMode?: PermissionMode; sink: EventSink
 }

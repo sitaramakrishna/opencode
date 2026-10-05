@@ -52,6 +52,7 @@ export function debugServer(args: CliArgs) {
       const keys = Object.keys(record.sources) as Array<keyof CapabilityRecord["sources"]>
       yield* Console.log(clean([
         `server ${redactUrl(handle.baseURL)} · model ${handle.model.id}${handle.local ? " (loopback)" : ""}`,
+        ...(record.npm ? [`hosted           ${record.npm} · auth ${record.auth ?? "none"}${record.headers ? ` · headers ${record.headers.join(",")}` : ""} · context ${handle.contextWindow} · max_tokens ${handle.maxTokens}`] : []),
         ...keys.map((key) => `${key.padEnd(16)} ${JSON.stringify(record[key])}  (${record.sources[key]})`),
         ...(record.ttft_ms ? [`ttft_ms          ${record.ttft_ms.map(Math.round).join(" → ")}`] : []),
         ...fallbackNotices(handle).map((item) => `notice: ${item.message}`),

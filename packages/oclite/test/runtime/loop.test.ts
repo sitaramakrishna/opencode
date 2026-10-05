@@ -1,10 +1,11 @@
 // Agent loop against the sanctioned fake server (test/lib/local-server.ts) with the real app layer.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
 import path from "path"
-import { Cause, Effect, Exit, Fiber } from "effect"
+import { Cause, Effect, Exit, Fiber, Layer } from "effect"
 import type { CliArgs } from "../../src/cli/args"
 import { load } from "../../src/config/config"
-import { ConfigError, Runtime, SessionStore, type RenderEvent, type RunInput } from "../../src/contract"
+import { Asker, ConfigError, Runtime, SessionStore, type RenderEvent, type RunInput } from "../../src/contract"
+import { exitCode } from "../../src/render/event"
 import { headlessAsker } from "../../src/permission/permission"
 import { appLayer } from "../../src/runtime/runtime"
 import { reply, startLocalServer, type ChatBody, type LocalServer, type Toggles } from "../lib/local-server"
@@ -48,7 +49,7 @@ function pins(toggles: Partial<Toggles>, thinkingKnob: boolean) {
 
 async function setup(
   toggles: Partial<Toggles> = {},
-  extra: { files?: Record<string, string>; agent?: string; thinkingKnob?: boolean } = {},
+  extra: { files?: Record<string, string>; agent?: string; thinkingKnob?: boolean; providerOptions?: Record<string, unknown>; asker?: Layer.Layer<Asker> } = {},
 ) {
   const server = await startLocalServer(toggles)
   const project = await tmpdir({ git: true, files: extra.files })
@@ -57,7 +58,7 @@ async function setup(
     ".oclite/config.json",
     JSON.stringify({
       model: "local/test-model",
-      provider: { local: { npm: "@ai-sdk/openai-compatible", options: { baseURL: server.url }, models: { "test-model": { reasoning: true } } } },
+      provider: { local: { npm: "@ai-sdk/openai-compatible", options: { baseURL: server.url, ...extra.providerOptions }, models: { "test-model": { reasoning: true } } } },
       servers: { [server.url]: pins(toggles, extra.thinkingKnob ?? false) },
     }),
   )
@@ -92,7 +93,7 @@ async function setup(
         const result = yield* handle.await
         return { result, records: yield* store.read(handle.session_id) }
       })
-      const output = await Effect.runPromise(program.pipe(Effect.provide(appLayer(cfg, headlessAsker, undefined, { retryDelays: [5, 10, 20] }))))
+      const output = await Effect.runPromise(program.pipe(Effect.provide(appLayer(cfg, extra.asker ?? headlessAsker, undefined, { retryDelays: [5, 10, 20] }))))
       return { ...output, events }
     },
     /** Runs `body` against a freshly built app layer (for handle-level tests). */
@@ -178,6 +179,55 @@ describe("agent loop (local-server)", () => {
     expect(env.server.chats()[0]!.dropped).toBe(true)
     expect(out.events.some((event) => event.type === "status" && event.phase === "retry")).toBe(true)
     expect(out.records.filter((record) => record.type === "text")).toHaveLength(1)
+  })
+
+  test("a header timeout is retried once, then ends the run with the timeout message", async () => {
+    await using env = await setup({ header_delay_ms: 500 }, { providerOptions: { headerTimeout: 100 } })
+    env.server.queue(reply.text("never"), reply.text("never"), reply.text("never"))
+    const out = await env.run("hi")
+    expect(out.result).toMatchObject({ state: "failed", reason: "error" })
+    expect(out.result.error).toContain("within 0.1 s")
+    expect(out.result.error).toContain("raise provider.local.options.headerTimeout")
+    expect(env.server.chats()).toHaveLength(2)
+    expect(out.events.filter((event) => event.type === "status" && event.phase === "retry")).toHaveLength(1)
+  })
+
+  test("doom-loop guard, headless: the same call denied 3 times ends the run (exit 3) with an allow hint", async () => {
+    await using env = await setup()
+    const call = reply.tool_call({ name: "bash", args: { command: "git log -1 --pretty=%B" } })
+    Array.from({ length: 6 }).forEach(() => env.server.queue(call))
+    const out = await env.run("show the last commit")
+    expect(env.server.chats()).toHaveLength(3)
+    expect(out.result).toMatchObject({ state: "failed", reason: "error", denied: 3 })
+    expect(out.result.error).toContain("was denied 3 times with identical input")
+    expect(out.result.error).toContain('--allowed-tools "bash(git log*)"')
+    expect(exitCode(out.result, true)).toBe(3)
+  })
+
+  test("doom-loop guard, REPL: a reminder after 3 denials, the run stops after 3 more", async () => {
+    const asker = Layer.succeed(Asker, { ask: () => Effect.succeed("reject" as const) })
+    await using env = await setup({}, { asker })
+    const call = reply.tool_call({ name: "bash", args: { command: "git log -1" } })
+    Array.from({ length: 8 }).forEach(() => env.server.queue(call))
+    const out = await env.run("show the last commit")
+    const chats = env.server.chats()
+    expect(chats).toHaveLength(6)
+    expect(JSON.stringify(chats[2]!.body)).not.toContain("must not be retried")
+    expect(String(chats[3]!.body!.messages!.at(-1)?.content)).toContain("<system-reminder>\nThe call bash git log -1 was denied 3 times. It is denied and must not be retried")
+    expect(out.result).toMatchObject({ state: "failed", reason: "error" })
+    expect(out.result.error).toContain("was denied 6 times")
+  })
+
+  test("doom_loop: a third identical successful call asks first (headless: rejected and fed back)", async () => {
+    await using env = await setup({}, { files: { "a.txt": "A" } })
+    const call = reply.tool_call({ name: "read", args: { filePath: "a.txt" } })
+    env.server.queue(call, call, call, reply.text("done"))
+    const out = await env.run("read it")
+    const results = out.records.flatMap((record) => (record.type === "tool_result" ? [record] : []))
+    expect(results.map((record) => record.status)).toEqual(["ok", "ok", "denied"])
+    expect(results[2]!.output).toContain("doom_loop: read a.txt repeated 3 times with identical input")
+    expect(out.records.some((record) => record.type === "permission" && record.tool === "doom_loop")).toBe(true)
+    expect(out.result).toMatchObject({ reason: "stop", text: "done", denied: 1 })
   })
 
   test("max turns ends the run with reason max_turns", async () => {

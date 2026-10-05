@@ -60,6 +60,7 @@ export async function setup(options: SetupOptions = {}) {
       provider: { dad: provider(parent.url), kid: provider(child.url) },
       servers: { [parent.url]: pins, [child.url]: pins },
       permission: { task: "allow" },
+      rtk: false, // hermetic: a real rtk on PATH would rewrite the children's commands
       agent: { explore: childModel, code: childModel, audit: childModel },
       ...(options.mcp ? { mcp: { fixture: { type: "local", command: [process.execPath, fixture] } } } : {}),
       ...options.config,

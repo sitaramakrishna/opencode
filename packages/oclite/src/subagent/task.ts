@@ -46,7 +46,7 @@ export function taskTool(input: { ctx: RunToolContext; subagents: SubagentsShape
         }
         const info = yield* input.subagents
           .spawn({
-            parent: { session_id: ctx.session_id, depth: ctx.depth, ruleset: ctx.ruleset, call_id: call?.id ?? id("call"), cwd: ctx.cwd },
+            parent: { session_id: ctx.session_id, depth: ctx.depth, ruleset: ctx.ruleset, call_id: call?.id ?? id("call"), cwd: ctx.cwd, model: ctx.model },
             agent: params.subagent_type,
             prompt: params.prompt,
             description: params.description,

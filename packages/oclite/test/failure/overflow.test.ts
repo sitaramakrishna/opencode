@@ -42,4 +42,27 @@ describe("context overflow", () => {
     expect(String(stream.find((event) => event.type === "error")?.message)).toContain("maximum context length")
     expect(stream.at(-1)).toMatchObject({ type: "result", state: "failed", exit_code: 1 })
   }, 30_000)
+
+  test("llama.cpp exceed_context_size_error: window parsed, output cap shrinks, the retry fits", async () => {
+    // The probe sees 32768 (as llama.cpp's n_ctx_train would overstate n_ctx); the server really has 16384.
+    await using env = await setup()
+    const big = reply.tool_call({ name: "bash", args: { command: `awk 'BEGIN{for(i=0;i<4000;i++)printf "%079d\\n", i}'` } })
+    const llama = { error: { code: 400, message: "request (16649 tokens) exceeds the available context size (16384 tokens), try increasing it",
+      type: "exceed_context_size_error", n_prompt_tokens: 16649, n_ctx: 16384 } }
+    env.server.queue(big, reply.error(400, llama), reply.text("SUMMARY OF WORK"), big, reply.text("done"))
+    const result = await spawn(env, ["-p", "list it", "--allowed-tools", "bash", "--output-format", "stream-json"])
+    expect(result.code).toBe(0)
+    const chats = env.server.chats()
+    expect(chats.map((chat) => chat.status)).toEqual([200, 400, 200, 200, 200])
+    // The retry carries the summary, not the 320 KB-class result that overflowed.
+    expect(JSON.stringify(chats[3]?.body?.messages)).toContain("SUMMARY OF WORK")
+    expect(JSON.stringify(chats[3]?.body?.messages)).not.toContain("0".repeat(79))
+    const records = await exportSession(env, String(events(result.stdout).at(-1)?.session_id))
+    const outputs = records.flatMap((record) => (record.type === "tool_result" ? [Buffer.byteLength(String(record.output))] : []))
+    // local profile: 0.15 × window × 4 chars, plus the hint. 32768 → 19660 B, then 16384 (parsed) → 9830 B.
+    expect(outputs).toHaveLength(2)
+    expect(outputs[0]).toBeGreaterThan(19000)
+    expect(outputs[1]).toBeGreaterThan(9000)
+    expect(outputs[1]).toBeLessThan(10500)
+  }, 30_000)
 })

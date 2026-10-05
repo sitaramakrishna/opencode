@@ -9,6 +9,7 @@ import { redactText, redactUrl, urlSecrets } from "../util/redact"
 export type CapabilityRecord = Capabilities & {
   v: 1; base_url: string; model: string; probed_at: number; ttl_ms: number
   sources: Record<keyof Capabilities, CapSource>; ttft_ms?: [number, number]; notes: string[]
+  npm?: string; auth?: string; headers?: string[]          // hosted only: provider package; credential source label; extra header NAMES (never values)
 }
 export type CapabilityPatch = Partial<Omit<Capabilities, "accepts">> & { accepts?: Partial<Capabilities["accepts"]> }
 export type ProbeInput = {

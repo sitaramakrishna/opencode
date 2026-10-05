@@ -20,6 +20,7 @@ export const PROFILES: Record<ProfileName, Profile> = {
     stubAfterTurns: 6,
     compactAt: 0.75,
     budgetTokens: 7300,
+    toolOutputShare: 0.25,
   },
   local: {
     name: "local",
@@ -33,6 +34,7 @@ export const PROFILES: Record<ProfileName, Profile> = {
     stubAfterTurns: 6,
     compactAt: 0.75,
     budgetTokens: 1200,
+    toolOutputShare: 0.15,
   },
   "local-min": {
     name: "local-min",
@@ -46,6 +48,7 @@ export const PROFILES: Record<ProfileName, Profile> = {
     stubAfterTurns: 3,
     compactAt: 0.6,
     budgetTokens: 600,
+    toolOutputShare: 0.15,
   },
 }
 

@@ -40,6 +40,26 @@ oclite -p "summarize what src/ does"          # one shot
 oclite --model openai/gpt-5 -p "…"            # openai/<model> reads OPENAI_API_KEY
 ```
 
+### Hosted models via opencode
+
+oclite reuses your opencode login and opencode's cached models.dev catalog (both read-only; run opencode once to create
+them). OpenCode Zen is provider `opencode`; google, amazon-bedrock, azure, openrouter, xai and other catalog providers
+work the same way, with no config:
+
+```sh
+oclite -p "summarize src/" --model opencode/muse-spark-1.3   # paid Zen model, via your login
+oclite debug server --model opencode/muse-spark-1.3          # npm, URL, limits, credential label, header names
+```
+
+The key comes from `options.apiKey`, then the provider's env var, then opencode's store (`opencode.db`, `auth.json`).
+Paid Zen models work through your opencode login: oclite asks opencode's `/api/config` (read-only, once per run) for the
+URL, package and headers that apply to your account, as opencode does. **The Zen free tier is OpenCode-app-only** (Zen
+answers `403 FreeTierError` to other clients), so use a paid model, e.g. `opencode/muse-spark-1.3`. Without a login Zen
+gets `"public"`, which only free models accept, so it fails from oclite. An expired opencode login stops with
+`run opencode once to refresh it`; oclite never refreshes or writes opencode's files. A credential is sent only to the
+catalog's own URL (or a baseURL in your user config), never to one from a project config. Details: `docs/CONFIG.md`.
+`oclite models` is not implemented.
+
 ### A local openai-compatible server
 
 Point a provider at the server's `/v1` base URL. The provider id (`local` here) is your choice; the model id must
@@ -67,7 +87,10 @@ oclite debug prompt --tokens   # fixed per-request overhead, as the server count
 oclite -p "list the files in src"
 ```
 
-A loopback base URL (`localhost`, `127.*`, `::1`) selects the `local` profile automatically (see Profiles).
+A loopback base URL (`localhost`, `127.*`, `::1`) selects the `local` profile automatically (see Profiles). It
+also gets long streaming timeouts: 30 min to the first response byte (prefill of a big prompt on a slow model) and
+10 min between chunks. Hosted providers get opencode's 300 s. Change them with `provider.<id>.options.headerTimeout`
+/ `chunkTimeout` (ms, `false` = off; docs/CONFIG.md → provider).
 
 ### `-p` and the three output formats
 
@@ -81,7 +104,8 @@ oclite -p "list files" --output-format stream-json   # one JSON event per line a
 there were any. `stream-json` emits `system`, `status`, `text_delta`, `reasoning_delta`, `tool_start`, `tool_end`,
 `step_finish`, `result` and `error` events. Every event has `session_id` and `agent_path` (sub-agent nesting).
 Headless runs can't answer permission prompts: every `ask` is rejected and the run exits 3 at the end (see
-Security notes). Use `--allowed-tools` or `--permission-mode` to pre-approve.
+Security notes). Use `--allowed-tools` or `--permission-mode` to pre-approve. When the model retries the same denied
+call 3 times, the run stops right away (exit 3) and names the `--allowed-tools` rule that would allow it.
 
 ## CLI reference
 
@@ -204,6 +228,7 @@ the first time it engages. `oclite debug server` shows every field and its sourc
 | `mcp <name>: failed — …` / `needs_auth — …; run: oclite mcp auth <name>` | An MCP server didn't connect; the run continues without it | fix the entry, `/reconnect` |
 | `queued behind <label>` | Local servers get one request at a time (`concurrency: 1`), shared by sub-agents and side calls | `servers[…].concurrency` |
 | `retrying: … (attempt n)` | Connection drop or 5xx: retried after 2 s, 4 s, 8 s | – |
+| `no response from <url> within 1800 s (…)` / `stream from <url> stalled: no data for 600 s (…)` | The streaming header or chunk timeout fired; retried once | `provider.<id>.options.headerTimeout` / `chunkTimeout` |
 
 **Probe caveats.** Two probed fields are heuristics, and both have a pin as the reliable path:
 - `tools_native` depends on the model actually calling the canary tool. A model that ignores it is recorded as
@@ -233,8 +258,10 @@ the first time it engages. `oclite debug server` shows every field and its sourc
   agents), tools whose server declares `annotations.readOnlyHint: true` are allowed without asking and all other
   MCP tools are denied. The hint is the server's own claim and can't be verified; see Security notes.
 - **Deferred tools in local profiles**: to save tokens, `local` and `local-min` send only a `tool_search` tool
-  (`{query, limit?}`). Matching tools become callable from the next turn, and a server's `instructions` arrive with
-  the search result. The `default` profile sends every MCP schema up front.
+  (`{query, limit?}`). Its description lists the deferred tool names per server, because small models don't search
+  for tools they can't see. Matching tools become callable from the next turn, and a server's `instructions` arrive
+  with the search result. A prompt that says `git mcp` (server name + "mcp") loads that server's tools from the start.
+  The `default` profile sends every MCP schema up front.
 - **Prompts and resources** (REPL): `/mcp__<server>__<prompt> key=value …` and `@<server>:<uri>`. Resource text over
   8 KB is saved to a file and attached by path.
 - Timeouts: 30 s per request and connect by default (`timeout` in ms per server); progress notifications reset it.
@@ -288,7 +315,8 @@ sub-agent with its own system prompt, tools and permissions. It sees only the br
 and hands back only its final message in `<task id="…" state="completed|error"><task_result>…</task_result></task>`
 (cut at about 4000 tokens). Background tasks report at the parent's next turn boundary. Limits: depth 2
 (`subagent.max_depth`, and the parent agent's `max_depth`), 4 running children per parent (`subagent.max_concurrent`).
-A child inherits its parent's deny rules; a read_only or plan-mode parent starts its children in plan mode.
+A child without its own `model` runs on its parent's model (not the global default), so a local-only agent keeps its
+sub-agents local. A child inherits its parent's deny rules; a read_only or plan-mode parent starts its children in plan mode.
 
 Built-in roles (`packages/oclite/agents/*.md`, overridable by a project file with the same name):
 
@@ -316,6 +344,21 @@ mcp:
 The same envelope, limits and parent deny rules apply, and the child's permission asks come back to the parent.
 With `url:`, the bearer token is the agent's `mcp.token`, else `OCLITE_MCP_TOKEN` for loopback URLs only. `task_id`
 resume isn't supported for `transport: mcp`. In an untrusted project, `transport`/`mcp` are ignored.
+
+### Token savers: `rtk` and `style.caveman`
+
+Two config keys make agents, and above all sub-agents, cheaper ([docs/CONFIG.md](docs/CONFIG.md#rtk-and-style)):
+
+```json
+{ "rtk": "auto", "style": { "caveman": "full", "scope": "subagents" } }
+```
+
+- `rtk` (default `"auto"`: on when `rtk` is on PATH). After the permission check and
+  PreToolUse hooks have passed the model's command, the `bash` tool runs `rtk rewrite` on it and runs the compressed
+  form (`ls -R` → `rtk ls -R`), with one `rtk: … → …` notice per rewrite. The approval is always for the original.
+- `style.caveman` (`off` by default; `lite`, `full`, `ultra`) appends a terse-prose rule block to the system prompt of
+  sub-agents (`scope: "subagents"`) or every agent (`"all"`). A child's final message becomes the parent's task
+  result, so terse children save parent context. Code, commands and file contents stay normal.
 
 ## Hooks
 

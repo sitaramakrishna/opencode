@@ -43,7 +43,7 @@ export function make(options: { describe?: Describe } = {}) {
       const permission = yield* Permission
       const hooks = yield* Hooks
 
-      const wrap = (ctx: RunToolContext, item: BuiltinTool, description: string) =>
+      const wrap = (ctx: RunToolContext, item: BuiltinTool, description: string, context: { tokens: number }) =>
         Tool.make({
           description,
           jsonSchema: terse(ctx.profile, toDefinitions({ [item.name]: item.tool })[0].inputSchema),
@@ -100,14 +100,16 @@ export function make(options: { describe?: Describe } = {}) {
               if (pre.kind === "warn") yield* notice(ctx, pre.message)
               const timeoutMs = item.timeoutFor?.(input) ?? item.timeoutMs
               const callId = call?.id ?? id("call")
+              // A result may take profile.toolOutputShare of the window (≈ 4 chars per token), never over 50 KB.
+              const maxBytes = Math.min(MAX_BYTES, Math.floor(context.tokens * ctx.profile.toolOutputShare * 4))
               const value: unknown = yield* item.tool.execute(input, call).pipe(
                 Effect.timeoutOrElse({
                   duration: timeoutMs,
                   orElse: () => Effect.fail(failure("timeout", `timed out after ${timeoutMs / 1000} s`)),
                 }),
-                // Error text is model input too: same 2000-line / 50 KB cut as output.
+                // Error text is model input too: same cut as output.
                 Effect.catch((error) =>
-                  Effect.promise(() => truncate(error.message, ctx.session_id, callId)).pipe(
+                  Effect.promise(() => truncate(error.message, ctx.session_id, callId, maxBytes)).pipe(
                     Effect.flatMap((cut) =>
                       Effect.fail(new ToolFailure({ message: cut.text, error: error.error, metadata: error.metadata })),
                     ),
@@ -116,7 +118,7 @@ export function make(options: { describe?: Describe } = {}) {
               )
               // Built-in and MCP tools return text; anything else is shown as JSON.
               const output = typeof value === "string" ? value : JSON.stringify(value)
-              const result = yield* Effect.promise(() => truncate(output, ctx.session_id, callId))
+              const result = yield* Effect.promise(() => truncate(output, ctx.session_id, callId, maxBytes))
               const post = yield* hooks.run("PostToolUse", { ...hook, tool_output: result.text })
               if (post.kind === "warn") yield* notice(ctx, post.message)
               // PostToolUse exit 2 can't undo the call; its stderr goes to the model with the output (Claude Code does the same).
@@ -132,7 +134,7 @@ export function make(options: { describe?: Describe } = {}) {
               ...ctx.profile.tools,
               ...ctx.profile.optionalTools.filter((name) => ctx.agent.tools?.includes(name)),
             ])
-            const builtins = [...fsTools(ctx), ...searchTools(ctx), bashTool(ctx), ...extraTools(ctx, cfg)]
+            const builtins = [...fsTools(ctx), ...searchTools(ctx), bashTool(ctx, cfg.rtk), ...extraTools(ctx, cfg)]
             const candidates: BuiltinTool[] = [
               ...builtins.filter((item) => selected.has(item.name)),
               ...extra.filter(
@@ -140,9 +142,11 @@ export function make(options: { describe?: Describe } = {}) {
               ),
             ]
             const visible = candidates.filter((item) => !hidden(item.name, ctx.ruleset))
+            const context = { tokens: ctx.agent.max_context_tokens ?? caps.context_window }
             const described = yield* Effect.forEach(visible, (item) =>
               Effect.promise(
-                async () => [item.name, wrap(ctx, item, await describe(options.describe, ctx.profile, item))] as const,
+                async () =>
+                  [item.name, wrap(ctx, item, await describe(options.describe, ctx.profile, item), context)] as const,
               ),
             )
             const tools: Record<string, AnyExecutableTool> = Object.fromEntries(described)
@@ -165,6 +169,7 @@ export function make(options: { describe?: Describe } = {}) {
                 return caps.tools_native ? undefined : grammar(definitions())
               },
               readOnly: new Set(visible.filter((item) => item.readOnly).map((item) => item.name)),
+              context,
               activate: (names) =>
                 Effect.sync(() => {
                   names.filter((name) => name in tools && !active.has(name)).forEach((name) => active.add(name))

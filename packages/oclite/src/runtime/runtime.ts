@@ -32,6 +32,8 @@ import { run, type LoopDeps, type LoopResult } from "./loop"
 export interface RuntimeOptions {
   /** Retry backoff in ms (default 2/4/8 s; OCLITE_RETRY_SCALE multiplies it, for subprocess tests). */
   retryDelays?: readonly number[]
+  /** Set by appLayer when the asker is headlessAsker (`-p`): the doom-loop guard then stops at once. */
+  headless?: boolean
 }
 
 // Every service module exports `layer`; they load as module objects (also keeps them off the startup path).
@@ -50,7 +52,7 @@ export function appLayer(cfg: ResolvedConfig, asker: Layer.Layer<Asker>, http?: 
         Layer.provideMerge(registry.layer, permission.layer.pipe(Layer.provideMerge(asker))),
         base.pipe(Layer.provide(config)),
       )
-      return Layer.provideMerge(layer(options), services)
+      return Layer.provideMerge(layer({ ...options, headless: asker === permission.headlessAsker }), services)
     }),
   )
 }
@@ -78,6 +80,7 @@ export function layer(options: RuntimeOptions = {}) {
         parse,
         persistContext: (handle, tokens) => persist(handle.baseURL, handle.model.id, { context_window: tokens }, "error-400"),
         retryDelays: options.retryDelays ?? [2000, 4000, 8000].map((ms) => ms * scale),
+        headless: options.headless ?? false,
       }
 
       const start: RuntimeShape["start"] = (input, sink) =>
@@ -108,20 +111,20 @@ export function layer(options: RuntimeOptions = {}) {
           const ruleset = permission.ruleset({ agent, mode: input.permissionMode ?? cfg.permissionMode,
             parent: input.parent?.ruleset, mcpReadOnly: servers.readOnly })
           yield* status("tools", "building tools")
-          const ctx = { session_id, cwd, agent, depth, ruleset, sink, profile }
+          const ctx = { session_id, cwd, agent, depth, ruleset, sink, profile, model: handle.ref }
           const mode = input.permissionMode ?? cfg.permissionMode
           const parentReadOnly = mode === "plan" || agent.read_only
           const tools = yield* registry.build(ctx, [...servers.extra, taskTool({ ctx, subagents, cfg, parentReadOnly })], handle.capabilities)
-          const mcpInstructions = yield* servers.bind(tools, replay(previous).activated)
+          const text = typeof input.prompt === "string" ? input.prompt
+            : input.prompt.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n")
+          const mcpInstructions = yield* servers.bind(tools, replay(previous).activated, text)
           yield* status("instructions", "loading instructions")
           const prompt = yield* Effect.promise(() =>
-            system({ harness: harnessPrompt(profile, handle), agent, cfg: { ...cfg, cwd }, profile, textProtocolPrompt: tools.textProtocolPrompt, mcpInstructions }),
+            system({ harness: harnessPrompt(profile, handle), agent, cfg: { ...cfg, cwd }, profile, textProtocolPrompt: tools.textProtocolPrompt, mcpInstructions, depth }),
           )
           yield* Effect.forEach(prompt.notices, (notice) => status("notice", notice), { discard: true })
           yield* sink({ session_id, agent_path, type: "system", agent: agent.name, model: handle.ref, profile: profile.name,
             tools: Object.keys(tools.tools).sort(), mcp: (yield* mcp.status()).map((item) => ({ name: item.name, status: item.status })) })
-          const text = typeof input.prompt === "string" ? input.prompt
-            : input.prompt.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n")
           yield* store.append(session_id, { type: "user", turn: replay(previous).turn, text, synthetic: false })
 
           const steers: string[] = []
@@ -132,6 +135,10 @@ export function layer(options: RuntimeOptions = {}) {
             maxTurns: Math.min(input.maxTurns ?? cfg.maxTurns ?? Infinity, agent.steps ?? Infinity),
             thinking: input.thinking ?? cfg.thinking ?? agent.thinking,
             steers: () => Effect.sync(() => steers.splice(0)),
+            doomLoop: (name, value) =>
+              permission.check({ session_id, agent: agent.name, ruleset, tool: "doom_loop", patterns: [name], always: [name],
+                summary: `${name} called 3 times with identical input`, metadata: { tool: name, input: value } })
+                .pipe(Effect.as(true), Effect.catch(() => Effect.succeed(false))),
           }).pipe(Effect.forkDetach)
           // A watcher settles the Deferred once, so every await works even after an earlier waiter was interrupted.
           const done = yield* Deferred.make<RunResult>()

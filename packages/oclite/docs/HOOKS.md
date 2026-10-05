@@ -106,7 +106,9 @@ exit 0
 
 - Only `PreToolUse`, `PostToolUse` and `Stop`; no `UserPromptSubmit`, `SessionStart`, `Notification`,
   `SubagentStop` or `PreCompact`.
-- Only exit codes are read. JSON on stdout (`decision`, `permissionDecision`, `continue`, …) is ignored.
+- Only exit codes are read. JSON on stdout (`decision`, `permissionDecision`, `continue`, …) is ignored, so a
+  hook can't rewrite `tool_input`. Claude Code's rtk rewrite hook is built in instead: config `rtk`
+  ([CONFIG.md](CONFIG.md#rtk-and-style)); hooks still see the original command.
 - `tool_name` is oclite's lowercase name and `tool_input` uses opencode's parameter names (`filePath`, not
   `file_path`), so scripts that read `.tool_input.file_path` need updating.
 - A hook can't approve a tool call; it can only block one. Approval stays with the permission system.

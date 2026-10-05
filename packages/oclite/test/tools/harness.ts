@@ -58,6 +58,7 @@ export const PROFILE: Profile = {
   stubAfterTurns: 6,
   compactAt: 0.75,
   budgetTokens: 7300,
+  toolOutputShare: 0.25,
 }
 
 export function config(cwd: string, overrides: Partial<ResolvedConfig> = {}): ResolvedConfig {
@@ -78,6 +79,8 @@ export function config(cwd: string, overrides: Partial<ResolvedConfig> = {}): Re
     permission_timeout_ms: 300_000,
     subagent: { max_depth: 2, max_concurrent: 4 },
     showThinking: true,
+    // Hermetic: a real rtk on the developer's PATH would rewrite `ls` and friends.
+    rtk: false,
     ...overrides,
   }
 }
@@ -190,6 +193,33 @@ export async function toolset(
         ToolRuntime.dispatch(built.set.tools, { type: "tool-call", id, name, input: args }).pipe(Effect.map(outcome)),
       ),
     denials: () => Effect.runPromise(built.permission.denials("ses_test")),
+  }
+}
+
+// `rtk rewrite ls…` → `echo REWRITTEN`, `rtk rewrite whoami…` → `rtk self` (runs this script again), else exit 1.
+const FAKE_RTK = `#!/bin/sh
+if [ "$1" = rewrite ]; then
+  case "$2" in
+    ls*) echo "echo REWRITTEN"; exit 0 ;;
+    whoami*) echo "rtk self"; exit 0 ;;
+  esac
+  exit 1
+fi
+echo "FAKE-RTK $*"
+`
+
+/** PATH for one test: a fake `rtk` first on it, or (`missing`) a PATH with no rtk at all. Restored on dispose. */
+export async function rtkPath(options: { missing?: boolean } = {}) {
+  const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "oclite-rtk-")))
+  await Bun.write(path.join(dir, "rtk"), FAKE_RTK)
+  await fs.chmod(path.join(dir, "rtk"), 0o755)
+  const previous = process.env.PATH
+  process.env.PATH = options.missing ? "/usr/bin:/bin" : `${dir}${path.delimiter}${previous}`
+  return {
+    [Symbol.asyncDispose]: async () => {
+      process.env.PATH = previous
+      await fs.rm(dir, { recursive: true, force: true })
+    },
   }
 }
 
