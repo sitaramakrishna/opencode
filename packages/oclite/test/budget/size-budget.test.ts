@@ -33,7 +33,7 @@ describe("size budget", () => {
   })
 
   test("fails over 7360 lines, and forked/ lines are not counted", async () => {
-    await using over = await tmpdir({ files: { "a.ts": lines(4000), "b/c.ts": lines(3321) } })
+    await using over = await tmpdir({ files: { "a.ts": lines(4000), "b/c.ts": lines(3361) } })
     const result = await budget(over.path)
     expect(result.code).toBe(1)
     expect(result.stderr).toContain("line count 7361 > 7360")
