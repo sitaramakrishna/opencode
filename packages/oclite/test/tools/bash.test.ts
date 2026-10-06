@@ -84,10 +84,22 @@ describe("rtk rewrite", () => {
     await using dir = await tmpdir()
     await using _path = await rtkPath()
     const tools = await toolset(rtkOn(dir.path))
-    expect((await tools.call("bash", { command: "ls -la" })).text).toBe("REWRITTEN")
+    expect((await tools.call("bash", { command: "ls -la" })).text).toBe("FAKE-RTK ls -la")
     expect((await tools.call("bash", { command: "echo plain" })).text).toBe("plain")
-    expect((await tools.call("bash", { command: "whoami" })).text).toBe("FAKE-RTK self")
-    expect(notices(tools.events)).toEqual(["rtk: ls -la → echo REWRITTEN", "rtk: whoami → rtk self"])
+    expect((await tools.call("bash", { command: "whoami" })).text).not.toContain("FAKE-RTK")
+    expect(notices(tools.events)).toEqual(["rtk: ls -la → rtk ls -la", 'rtk: ignored rewrite of "whoami" (not "rtk <command>")'])
+  })
+
+  test("a rewrite that is not rtk <command> never runs", async () => {
+    await using dir = await tmpdir({ files: { "note.txt": "hello" } })
+    await using _path = await rtkPath()
+    const tools = await toolset(
+      config(dir.path, { rtk: "auto", permission: [{ permission: "bash", pattern: "cat *", action: "allow" }] }),
+    )
+    const result = await tools.call("bash", { command: "cat note.txt" })
+    expect(result.text).toBe("hello")
+    expect(result.text).not.toContain("PWNED")
+    expect(notices(tools.events)).toEqual(['rtk: ignored rewrite of "cat note.txt" (not "rtk <command>")'])
   })
 
   test("rtk: false disables it", async () => {
@@ -115,9 +127,9 @@ describe("rtk rewrite", () => {
     await using _path = await rtkPath()
     const seen = path.join(dir.path, "hook.json")
     const hooks = { PreToolUse: [{ matcher: "*", command: `cat > ${seen}`, timeout_ms: 5000 }], PostToolUse: [], Stop: [] }
-    // Allowed as `ls *`; the rewritten `echo REWRITTEN` would not be.
+    // Allowed as `ls *`; the rewrite is exactly `rtk ls -la`, which calls the same rtk binary.
     const allowed = await toolset(rtkOn(dir.path, { permission: [{ permission: "bash", pattern: "ls *", action: "allow" }], hooks }))
-    expect((await allowed.call("bash", { command: "ls -la" })).text).toBe("REWRITTEN")
+    expect((await allowed.call("bash", { command: "ls -la" })).text).toBe("FAKE-RTK ls -la")
     expect(JSON.parse(await Bun.file(seen).text()).tool_input.command).toBe("ls -la")
     // Only the rewritten form is allowed: the original is still not, so headless denies it and nothing runs.
     const widened = await toolset(rtkOn(dir.path, { permission: [{ permission: "bash", pattern: "echo *", action: "allow" }] }))

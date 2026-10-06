@@ -30,9 +30,9 @@ describe("sub-agents", () => {
     expect(out.result.state).toBe("completed")
     const childId = taskIds(results(out.records)[0]!.output)[0]!
     const childResults = results(await Effect.runPromise(out.store.read(childId)))
-    expect(childResults.map((record) => [record.name, record.status, record.output])).toEqual([["bash", "ok", "REWRITTEN"]])
+    expect(childResults.map((record) => [record.name, record.status, record.output])).toEqual([["bash", "ok", "FAKE-RTK ls -la"]])
     expect(env.events.some((event) => event.type === "status" && event.agent_path[0] === "code"
-      && event.message === "rtk: ls -la → echo REWRITTEN")).toBe(true)
+      && event.message === "rtk: ls -la → rtk ls -la")).toBe(true)
     expect(systemOf(env.child.chats()[0]!.body)).toContain("# Response style\nRespond terse.")
     expect(systemOf(env.parent.chats()[0]!.body)).not.toContain("# Response style")
   })

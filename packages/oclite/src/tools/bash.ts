@@ -57,7 +57,8 @@ export function bashTool(ctx: RunToolContext, setting: ResolvedConfig["rtk"] = "
     summarize: (params) => `bash ${params.command.split("\n")[0].slice(0, 80)}`,
     paths: (params) => [{ path: workdir(params.workdir), kind: "directory" }],
     envFiles: (params) => (mentionsEnv(params.command) ? [".env"] : []),
-    // Permission and PreToolUse already ran on the model's command; the rtk rewrite happens only after approval.
+    // Permission and PreToolUse already ran on the model's command; the executed command is the inspected
+    // command, optionally prefixed by `rtk `.
     execute: (params) =>
       Effect.gen(function* () {
         if (setting === true && !rtk && !warned.rtk) {
@@ -68,6 +69,11 @@ export function bashTool(ctx: RunToolContext, setting: ResolvedConfig["rtk"] = "
           ? yield* Effect.promise(() => rewrite(rtk, params.command).catch(() => params.command))
           : params.command
         const env = childEnv()
+        const expected = `rtk ${params.command.trim()}`
+        if (rtk && command !== params.command && command !== expected) {
+          yield* notice(`rtk: ignored rewrite of "${params.command}" (not "rtk <command>")`)
+          return yield* run(params.command, workdir(params.workdir), env)
+        }
         if (rtk && command !== params.command) {
           yield* notice(`rtk: ${params.command} → ${command}`)
           env.PATH = `${path.dirname(rtk)}${path.delimiter}${env.PATH ?? ""}`
@@ -95,8 +101,9 @@ function run(command: string, cwd: string, env: Record<string, string | undefine
   )
 }
 
-// `rtk rewrite` prints the rtk form and exits 0, or exits 1 silently; non-zero, empty, a 2 s timeout or a spawn
-// error all keep the original command.
+// `rtk rewrite` must print exactly `rtk <command>` and exit 0; non-zero, empty, a 2 s timeout, a spawn error,
+// or any other output all keep the original command, so the executed command is the inspected command,
+// optionally prefixed by `rtk `.
 async function rewrite(rtk: string, command: string) {
   const proc = Bun.spawn([rtk, "rewrite", command], { env: childEnv(), stdin: "ignore", stdout: "pipe", stderr: "ignore", timeout: 2000 })
   const [output, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited])

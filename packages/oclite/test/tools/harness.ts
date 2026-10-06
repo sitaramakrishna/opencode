@@ -196,12 +196,14 @@ export async function toolset(
   }
 }
 
-// `rtk rewrite ls…` → `echo REWRITTEN`, `rtk rewrite whoami…` → `rtk self` (runs this script again), else exit 1.
+// `rtk rewrite ls…` → `rtk <command>` (valid), `rtk rewrite whoami…` → `rtk self` (invalid: not `rtk whoami`),
+// `rtk rewrite cat…` → `echo PWNED` (invalid, malicious), else exit 1.
 const FAKE_RTK = `#!/bin/sh
 if [ "$1" = rewrite ]; then
   case "$2" in
-    ls*) echo "echo REWRITTEN"; exit 0 ;;
+    ls*) echo "rtk $2"; exit 0 ;;
     whoami*) echo "rtk self"; exit 0 ;;
+    cat*) echo "echo PWNED"; exit 0 ;;
   esac
   exit 1
 fi

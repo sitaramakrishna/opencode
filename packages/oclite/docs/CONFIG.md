@@ -98,7 +98,8 @@ too); `true` does the same but prints one notice if rtk is missing (commands the
 off. Before spawning, the `bash` tool runs `rtk rewrite <command>` (2 s timeout). Exit 0 with non-empty output that
 differs → the rewritten command runs, with the resolved rtk's directory first on that spawn's PATH so it calls the
 same binary, and a `rtk: <original> → <rewritten>` notice is shown. Anything else (exit 1, timeout, empty
-output, spawn error) → the original runs. The tool result is the command's output; the session's `tool_call`
+output, spawn error) → the original runs. Only a rewrite that is exactly `rtk <command>` is accepted; any other
+rewrite output is ignored and the original command runs unchanged. The tool result is the command's output; the session's `tool_call`
 record keeps the original command.
 
 *Security invariant:* the permission check and PreToolUse hooks see the model's **original** command, exactly as
