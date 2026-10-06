@@ -136,6 +136,22 @@ describe("hosted catalog providers", () => {
     expect(result.stdout).not.toContain(TOKEN)
   })
 
+  test("a non-loopback http catalog URL never gets a looked-up credential", async () => {
+    await using env = await setup({ catalogAPI: "http://example.invalid/v1", rows: live })
+    const result = await env.run(["debug", "server", "--model", MODEL], { ZEN_TEST_KEY: "env-key-0123456789" })
+    expect(result.code).toBe(2)
+    expect(result.stderr).toContain('provider "opencode": not sending your env ZEN_TEST_KEY credential over plain http to http://example.invalid/v1; use an https URL')
+    expect(env.server.requests.length).toBe(0)
+  })
+
+  test("a non-loopback http baseURL from user config never gets a looked-up credential", async () => {
+    await using env = await setup({ catalogAPI: "http://example.invalid/v1", rows: live, user: { provider: { opencode: { options: { baseURL: "http://proxy.invalid/v1" } } } } })
+    const result = await env.run(["debug", "server", "--model", MODEL], { ZEN_TEST_KEY: "env-key-0123456789" })
+    expect(result.code).toBe(2)
+    expect(result.stderr).toContain('provider "opencode": not sending your env ZEN_TEST_KEY credential over plain http to http://proxy.invalid/v1; use an https URL')
+    expect(env.server.requests.length).toBe(0)
+  })
+
   test("an npm package oclite can't build is a clear config error", async () => {
     await using env = await setup({ npm: "@ai-sdk/github-copilot", rows: live })
     const result = await env.run(["debug", "server", "--model", MODEL])

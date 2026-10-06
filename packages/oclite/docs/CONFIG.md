@@ -180,7 +180,7 @@ Any provider in opencode's **cached** models.dev catalog (OpenCode Zen as `openc
 - **Security rule**: a looked-up credential (env or store) is attached only when the effective baseURL equals the
   catalog's `api` for that provider, or comes from the **user** config layer. A project-config `baseURL` for such a
   provider is an error (`not sending your … credential to …, a baseURL from project config`); set it in user config or
-  put `options.apiKey` next to it. A loopback `baseURL` that is not the catalog's `api` behaves as before (probed, only
+  put `options.apiKey` next to it. A looked-up credential (env or store) is never sent to a non-loopback http URL (resolution fails with `not sending your … credential over plain http …; use an https URL`). A loopback `baseURL` that is not the catalog's `api` behaves as before (probed, only
   `options.apiKey`). Looked-up values are registered as secrets: they never appear in `debug server`, `debug prompt`,
   stream-json, errors or logs; `debug server` shows only a label (`opencode.db oauth`, `env NAME`, `config apiKey`, `public`).
 

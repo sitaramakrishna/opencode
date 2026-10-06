@@ -141,6 +141,8 @@ function resolveModel(cfg: ResolvedConfig, ref: string, reprobe: boolean) {
     // A looked-up credential goes only to the catalog's own URL or a baseURL from the user config, never a project one.
     if (found?.stored && !listedURL && base && base !== (cfg as Partial<LoadedConfig>).userBaseURL?.[providerID])
       return yield* new ConfigError({ message: `provider "${providerID}": not sending your ${found.source} credential to ${redactUrl(base)}, a baseURL from project config; set it in user config or set options.apiKey` })
+    if (found?.stored && target && !target.startsWith("https://") && !isLoopback(target))
+      return yield* new ConfigError({ message: `provider "${providerID}": not sending your ${found.source} credential over plain http to ${redactUrl(target)}; use an https URL` })
     // What /api/config declared for this URL (opencode: provider and model headers; body options without credentials).
     const declared = listedURL && item ? { ...item.options?.headers as Record<string, string> | undefined, ...patch?.headers } : {}
     Object.values(declared).forEach(registerSecret)
